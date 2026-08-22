@@ -120,9 +120,12 @@ def train_faces(args):
             print(f"Or: python -m nanostream.train_faces --auto-capture 400")
             return None
 
+    device = torch.device(getattr(args, "device", "cuda" if torch.cuda.is_available() else "cpu"))
+    model = model.to(device)
+
     # Load real dataset
-    train_ds = WebcamFaceDataset(data_dir, augment=True)
-    eval_ds = WebcamFaceDataset(data_dir, augment=False)
+    train_ds = WebcamFaceDataset(data_dir, augment=True, cache_in_ram=True)
+    eval_ds = WebcamFaceDataset(data_dir, augment=False, cache_in_ram=True)
 
     out_dir = pathlib.Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -132,6 +135,7 @@ def train_faces(args):
 
     print("=" * 62)
     print("  NanoStream-OD Face Detector Training (REAL DATA)")
+    print(f"  Device     : {device} ({torch.cuda.get_device_name(0) if device.type == 'cuda' else 'CPU'})")
     print(f"  Resolution : {cfg.input_size}x{cfg.input_size} Grayscale")
     print(f"  Parameters : {total_params:,} ({total_params * 2 / 1024:.1f} KB @ int16)")
     print(f"  Real Frames: {n_samples}")
@@ -163,11 +167,13 @@ def train_faces(args):
             idx = np.random.randint(0, n_samples)
             batch_items.append(train_ds[idx])
         xs, ts = collate(batch_items)
+        xs = xs.to(device)
+        ts = [{k: v.to(device) for k, v in t.items()} for t in ts]
 
+        opt.zero_grad()
         preds = model(xs)
         losses = detection_loss(preds, ts, cfg, w_obj=3.0, w_box=3.0, w_l1=1.0, w_cls=0.5)
 
-        opt.zero_grad()
         losses["total"].backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
         opt.step()
@@ -178,7 +184,7 @@ def train_faces(args):
             model.eval()
             with torch.no_grad():
                 test_x, test_tgt = eval_ds[0]
-                test_preds = model(test_x.unsqueeze(0))
+                test_preds = model(test_x.unsqueeze(0).to(device))
                 obj_sig = torch.sigmoid(test_preds["obj"][0, 0])
                 max_obj = obj_sig.max().item()
                 n_above = (obj_sig > 0.25).sum().item()
