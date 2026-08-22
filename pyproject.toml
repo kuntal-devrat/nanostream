@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nanostream-od"
+version = "0.2.0"
+description = "NanoStream-OD: ultra-efficient, NMS-free patch-streaming object detector framework for <256KB RAM edge devices & laptops"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "NanoStream-OD contributors" }]
+keywords = ["tinyml", "object-detection", "microcontroller", "nms-free", "edgeai", "cortex-m", "esp32"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "numpy>=1.24",
+    "torch>=2.0",
+]
+
+[project.optional-dependencies]
+demo = ["opencv-python>=4.8"]
+dev = ["pytest>=7"]
+
+[project.scripts]
+nanostream-demo = "nanostream.demo:main"
+nanostream-train-faces = "nanostream.train_faces:main"
+nanostream-train-shapes = "nanostream.train_shapes:main"
+nanostream-train = "nanostream.train_shapes:main"
+nanostream-export = "nanostream.export_cli:main"
+nanostream-benchmark = "nanostream.benchmark:main"
+
+[tool.setuptools.packages.find]
+include = ["nanostream*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
