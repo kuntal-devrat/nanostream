@@ -20,6 +20,7 @@ import json
 import pathlib
 import time
 import urllib.request
+from typing import Union
 import numpy as np
 import torch
 import torch.utils.data
@@ -153,13 +154,14 @@ def detect_faces_yunet(detector, frame_bgr):
 
 
 def download_online_face_dataset(
-    output_dir: pathlib.Path = DATA_DIR,
+    output_dir: Union[str, pathlib.Path] = DATA_DIR,
     target_size: int = 160,
 ) -> int:
     """Download diverse real face photos from curated CDN, auto-labeled with YuNet."""
     if cv2 is None:
         raise ImportError("opencv-python required")
 
+    output_dir = pathlib.Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     img_dir = output_dir / "images"
     img_dir.mkdir(exist_ok=True)
@@ -253,7 +255,7 @@ def download_online_face_dataset(
 def capture_webcam_training_data(
     n_frames: int = 400,
     camera_id: int = 0,
-    output_dir: pathlib.Path = DATA_DIR,
+    output_dir: Union[str, pathlib.Path] = DATA_DIR,
     target_size: int = 160,
     show_preview: bool = True,
 ) -> int:
@@ -261,6 +263,7 @@ def capture_webcam_training_data(
     if cv2 is None:
         raise ImportError("opencv-python required")
 
+    output_dir = pathlib.Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     img_dir = output_dir / "images"
     img_dir.mkdir(exist_ok=True)
