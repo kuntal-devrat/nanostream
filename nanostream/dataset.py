@@ -365,8 +365,10 @@ def capture_webcam_training_data(
 class RealFaceDataset(torch.utils.data.Dataset):
     """PyTorch Dataset with robust multi-condition photorealistic augmentations."""
 
-    def __init__(self, data_dir: pathlib.Path = DATA_DIR, augment: bool = True):
+    def __init__(self, data_dir: Union[str, pathlib.Path] = DATA_DIR, img_size: int = 160,
+                 augment: bool = True, cache_in_ram: bool = False):
         self.data_dir = pathlib.Path(data_dir)
+        self.img_size = img_size
         self.img_dir = self.data_dir / "images"
         ann_path = self.data_dir / "annotations.json"
         if not ann_path.exists():
@@ -383,6 +385,8 @@ class RealFaceDataset(torch.utils.data.Dataset):
         with open(ann_path) as f:
             self.annotations = json.load(f)
         self.augment = augment
+        self.cache_in_ram = cache_in_ram
+        self.cache = {}
         self.rng = np.random.default_rng(42)
 
     def __len__(self):
@@ -390,10 +394,16 @@ class RealFaceDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         ann = self.annotations[idx % len(self.annotations)]
-        img_path = self.img_dir / ann["file"]
-        img = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE) if cv2 is not None else None
-        if img is None:
-            img = np.full((160, 160), 128, dtype=np.uint8)
+        file_key = ann["file"]
+        if self.cache_in_ram and file_key in self.cache:
+            img = self.cache[file_key].copy()
+        else:
+            img_path = self.img_dir / file_key
+            img = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE) if cv2 is not None else None
+            if img is None:
+                img = np.full((self.img_size, self.img_size), 128, dtype=np.uint8)
+            if self.cache_in_ram:
+                self.cache[file_key] = img.copy()
 
         h, w = img.shape[:2]
         boxes_px = [b[:] for b in ann["boxes"]]
