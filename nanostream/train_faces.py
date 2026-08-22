@@ -40,15 +40,16 @@ def evaluate_real_recall(model, dataset, n=100, conf=0.25, iou_thr=0.40):
     total_gt = 0
     false_pos = 0
     n_eval = min(n, len(dataset))
+    device = next(model.parameters()).device
 
     with torch.no_grad():
         for i in range(n_eval):
             x, tgt = dataset[i]
-            x = x.unsqueeze(0)  # (1, 1, H, W)
+            x = x.unsqueeze(0).to(device)  # (1, 1, H, W)
             preds = model(x)
             dets = decode_detections(preds, conf)
 
-            gt_boxes = tgt["boxes_norm"]
+            gt_boxes = tgt["boxes_norm"].to(device)
             if len(gt_boxes) == 0:
                 false_pos += dets.shape[0]
                 continue
