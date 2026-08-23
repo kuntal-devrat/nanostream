@@ -91,16 +91,24 @@ def load_model(checkpoint_path: Union[str, pathlib.Path] = None,
             model = NanoStreamOD(cfg)
         else:
             model = NanoStreamOD()
+
+        state_dict = ckpt["model"] if "model" in ckpt else ckpt
         try:
-            state_dict = ckpt["model"] if "model" in ckpt else ckpt
-            model.load_state_dict(state_dict)
-        except Exception:
-            model = NanoStreamOD(DEFAULT_CONFIG)
+            model.load_state_dict(state_dict, strict=True)
+            print(f"✅ Successfully loaded trained checkpoint from: {checkpoint_path}")
+        except Exception as e:
+            try:
+                model.load_state_dict(state_dict, strict=False)
+                print(f"⚠️ Loaded checkpoint with non-strict matching from: {checkpoint_path}")
+            except Exception as e2:
+                print(f"❌ Failed to load checkpoint weights: {e2}")
+
         if "classes" in ckpt:
             model.class_names = tuple(ckpt["classes"])
         else:
             model.class_names = CLASS_NAMES
     else:
+        print(f"⚠️ Warning: No trained checkpoint found at '{checkpoint_path}'. Using randomly initialized weights!")
         model = NanoStreamOD()
         model.class_names = CLASS_NAMES
 
