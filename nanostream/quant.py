@@ -67,12 +67,20 @@ def fold_bn_into_conv(conv_weight: torch.Tensor, bn,
     inv_std = torch.rsqrt(var + 1e-5)
     chan_scale = gamma * inv_std
     conv_weight = conv_weight.detach().float()
+    # Reshape for arbitrary weight dimensions (4D for 3×3, 2D for 1×1)
+    reshape = [-1] + [1] * (conv_weight.dim() - 1)
     if pure_shift:
-        snapped = snap_to_pow2(chan_scale.abs()) * torch.sign(chan_scale + 1e-12)
-        ratio = snapped / chan_scale.clamp(min=1e-12)
-        conv_weight = conv_weight * ratio.view(-1, 1, 1, 1)
+        # BUG-7 FIX: Use sign without eps bias — dead channels (scale==0) stay zero
+        chan_sign = torch.where(chan_scale > 0, torch.ones_like(chan_scale),
+                                torch.where(chan_scale < 0, -torch.ones_like(chan_scale),
+                                            torch.zeros_like(chan_scale)))
+        snapped = snap_to_pow2(chan_scale.abs()) * chan_sign
+        ratio = snapped / chan_scale.abs().clamp(min=1e-12)
+        # For dead channels where scale==0, don't scale weights
+        ratio = torch.where(chan_scale.abs() < 1e-12, torch.zeros_like(ratio), ratio)
+        conv_weight = conv_weight * ratio.view(reshape)
     else:
-        conv_weight = conv_weight * chan_scale.view(-1, 1, 1, 1)
+        conv_weight = conv_weight * chan_scale.view(reshape)
     b_fold = beta - gamma * mean * inv_std
     return conv_weight, b_fold
 

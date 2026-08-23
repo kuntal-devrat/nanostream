@@ -275,6 +275,28 @@ int ns_decode(ns_det_t *dets, int max_det, int conf_thr_q15) {
         if (prob > conf_thr_q15) {
             int row = cell / NS_GRID;
             int col = cell % NS_GRID;
+
+            /* 3x3 local peak suppression (Zero-NMS direct spatial filtering) */
+            int is_local_max = 1;
+            for (int dr = -1; dr <= 1; dr++) {
+                int nr = row + dr;
+                if (nr < 0 || nr >= NS_GRID) continue;
+                for (int dc = -1; dc <= 1; dc++) {
+                    if (dr == 0 && dc == 0) continue;
+                    int nc = col + dc;
+                    if (nc < 0 || nc >= NS_GRID) continue;
+                    int n_cell = nr * NS_GRID + nc;
+                    int32_t n_obj_q15 = (int32_t)g_obj[0][n_cell] << up;
+                    int16_t n_prob = ns_sig_q15(n_obj_q15);
+                    if (n_prob > prob) {
+                        is_local_max = 0;
+                        break;
+                    }
+                }
+                if (!is_local_max) break;
+            }
+            if (!is_local_max) continue;
+
             int16_t sx = ns_sig_q15((int32_t)g_box[0][cell] << up);
             int16_t sy = ns_sig_q15((int32_t)g_box[1][cell] << up);
             int16_t sw = ns_sig_q15((int32_t)g_box[2][cell] << up);

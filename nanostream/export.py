@@ -192,7 +192,13 @@ def export_c_header(model: NanoStreamOD, calib_fracs: dict, out_path: str | path
 
     head1_conv = head_module.conv1
     head_out_frac = calib_fracs["head_in_frac"].get("head1", 12) - head1_conv.fixed_out_shift
-    header_lines.insert(23, f"#define NS_HEAD_OUT_FRAC    {head_out_frac}")
+    # BUG-12 FIX: Find correct insertion point dynamically instead of hardcoded index
+    head_frac_line = f"#define NS_HEAD_OUT_FRAC    {head_out_frac}"
+    insert_idx = len(header_lines)
+    for idx, line in enumerate(header_lines):
+        if line.startswith("#define NS_") or line.startswith("#define NS_BOX"):
+            insert_idx = idx + 1
+    header_lines.insert(insert_idx, head_frac_line)
 
     # Write stage layers table
     header_lines.extend([

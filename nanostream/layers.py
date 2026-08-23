@@ -1,8 +1,7 @@
-"""ShiftConv2d & InvertedResidualBlock: convolutions whose weights are signed powers of two.
+"""ShiftConv2d, DepthwiseSeparableConv, LiteSqueezeExcite, InvertedResidualBlock.
 
-Frozen mode reconstructs weights as +/-2^e, so inference is pure shift-add.
-`forward_fixed_int` implements exact integer semantics (arithmetic shifts,
-int16 saturation) that mirror the generated MCU C kernel 1:1.
+v3.0: All conv weights are signed powers of two — inference is pure shift-add.
+`forward_fixed_int` implements exact integer semantics that mirror the C MCU kernel.
 """
 
 import torch
@@ -157,48 +156,163 @@ class ShiftConv2d(nn.Module):
         return y
 
 
-class InvertedResidualBlock(nn.Module):
-    """Inverted Residual Block: 1x1 Expand -> 3x3 Depthwise -> 1x1 Project + Residual Skip.
+class DepthwiseSeparableConv(nn.Module):
+    """Depthwise Separable Convolution: DW 3×3 + PW 1×1.
 
-    Dramatically expands the network receptive field with minimal parameter count.
+    Uses ~9× fewer parameters and MACs than regular 3×3 convolution.
+    All operations use ShiftConv2d for pure bit-shift execution on MCU.
     """
 
-    def __init__(self, in_channels, out_channels, stride=1, expand_ratio=2):
+    def __init__(self, cin, cout, stride=1, hint="dws"):
         super().__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.stride = stride
-        self.use_res_connect = self.stride == 1 and in_channels == out_channels
+        # 3×3 depthwise (groups=cin)
+        self.dw = ShiftConv2d(cin, cin, 3, stride=stride,
+                               groups=cin, bias=False).name(f"{hint}_dw")
+        self.dw_bn = nn.BatchNorm2d(cin)
+        # 1×1 pointwise
+        self.pw = ShiftConv2d(cin, cout, 1, stride=1,
+                               bias=False).name(f"{hint}_pw")
+        self.pw_bn = nn.BatchNorm2d(cout)
+        self.act = nn.ReLU(inplace=True)
 
-        hidden_dim = int(round(in_channels * expand_ratio))
-        self.expand_ratio = expand_ratio
+    def forward(self, x):
+        x = self.act(self.dw_bn(self.dw(x)))
+        x = self.act(self.pw_bn(self.pw(x)))
+        return x
+
+    def frozen_pairs(self):
+        return [(self.dw, self.dw_bn), (self.pw, self.pw_bn)]
+
+    @torch.no_grad()
+    def forward_int(self, x_int, in_frac):
+        y = self.dw.forward_fixed_int(x_int, in_frac)
+        y = torch.relu(y)
+        dw_frac = in_frac - self.dw.fixed_out_shift
+        y = self.pw.forward_fixed_int(y, dw_frac)
+        y = torch.relu(y)
+        return y
+
+
+class LiteSqueezeExcite(nn.Module):
+    """Lightweight Squeeze-and-Excitation block using only 1×1 shifts.
+
+    Channel attention: global avg pool → 1×1 reduce → ReLU → 1×1 expand → sigmoid
+    Costs <1% extra params/MACs for ~2-5% mAP improvement.
+    """
+
+    def __init__(self, channels, reduction=4, hint="se"):
+        super().__init__()
+        mid = max(4, channels // reduction)
+        self.squeeze = ShiftConv2d(channels, mid, 1, bias=True).name(f"{hint}_sq")
+        self.excite = ShiftConv2d(mid, channels, 1, bias=True).name(f"{hint}_ex")
+
+    def forward(self, x):
+        # Global average pooling
+        scale = x.mean(dim=(2, 3), keepdim=True)
+        scale = F.relu(self.squeeze(scale))
+        scale = torch.sigmoid(self.excite(scale))
+        return x * scale
+
+    def frozen_pairs(self):
+        return [(self.squeeze, None), (self.excite, None)]
+
+
+class InvertedResidualBlock(nn.Module):
+    """Inverted Residual Block: 1×1 Expand → 3×3 DW → 1×1 Project + Skip.
+
+    The core building block of MobileNetV2/V3 and EfficientNet.
+    Uses ShiftConv2d throughout for pure bit-shift MCU execution.
+    Optionally includes Squeeze-and-Excite channel attention.
+    """
+
+    def __init__(self, cin, cout, stride=1, expand_ratio=2,
+                 use_se=False, hint="irb"):
+        super().__init__()
+        self.cin = cin
+        self.cout = cout
+        self.stride = stride
+        self.use_res = (stride == 1 and cin == cout)
+        hidden = int(round(cin * expand_ratio))
 
         layers = []
+
+        # 1×1 Pointwise Expansion (skip if ratio == 1)
         if expand_ratio != 1:
-            # 1x1 Pointwise Expansion
-            self.expand_conv = ShiftConv2d(in_channels, hidden_dim, 1, bias=False).name("exp")
-            self.expand_bn = nn.BatchNorm2d(hidden_dim)
+            self.expand = ShiftConv2d(cin, hidden, 1, bias=False).name(f"{hint}_exp")
+            self.expand_bn = nn.BatchNorm2d(hidden)
         else:
-            self.expand_conv = None
+            self.expand = None
             self.expand_bn = None
 
-        # 3x3 Depthwise Convolution
-        self.dw_conv = ShiftConv2d(hidden_dim, hidden_dim, 3, stride=stride,
-                                   groups=hidden_dim, bias=False).name("dw")
-        self.dw_bn = nn.BatchNorm2d(hidden_dim)
+        # 3×3 Depthwise
+        self.dw = ShiftConv2d(hidden, hidden, 3, stride=stride,
+                               groups=hidden, bias=False).name(f"{hint}_dw")
+        self.dw_bn = nn.BatchNorm2d(hidden)
 
-        # 1x1 Linear Pointwise Projection
-        self.proj_conv = ShiftConv2d(hidden_dim, out_channels, 1, bias=False).name("proj")
-        self.proj_bn = nn.BatchNorm2d(out_channels)
+        # Squeeze-and-Excite (optional)
+        if use_se:
+            self.se = LiteSqueezeExcite(hidden, hint=f"{hint}_se")
+        else:
+            self.se = None
+
+        # 1×1 Pointwise Projection (linear, no activation)
+        self.proj = ShiftConv2d(hidden, cout, 1, bias=False).name(f"{hint}_proj")
+        self.proj_bn = nn.BatchNorm2d(cout)
 
     def forward(self, x):
         identity = x
         out = x
-        if self.expand_conv is not None:
-            out = F.relu6(self.expand_bn(self.expand_conv(out)))
-        out = F.relu6(self.dw_bn(self.dw_conv(out)))
-        out = self.proj_bn(self.proj_conv(out))
 
-        if self.use_res_connect:
+        if self.expand is not None:
+            out = F.relu(self.expand_bn(self.expand(out)))
+
+        out = F.relu(self.dw_bn(self.dw(out)))
+
+        if self.se is not None:
+            out = self.se(out)
+
+        out = self.proj_bn(self.proj(out))
+
+        if self.use_res:
             return identity + out
+        return out
+
+    def frozen_pairs(self):
+        pairs = []
+        if self.expand is not None:
+            pairs.append((self.expand, self.expand_bn))
+        pairs.append((self.dw, self.dw_bn))
+        if self.se is not None:
+            pairs.extend(self.se.frozen_pairs())
+        pairs.append((self.proj, self.proj_bn))
+        return pairs
+
+    @torch.no_grad()
+    def forward_int(self, x_int, in_frac):
+        identity = x_int
+        out = x_int
+        cur_frac = in_frac
+
+        if self.expand is not None:
+            out = self.expand.forward_fixed_int(out, cur_frac)
+            out = torch.relu(out)
+            cur_frac = cur_frac - self.expand.fixed_out_shift
+
+        out = self.dw.forward_fixed_int(out, cur_frac)
+        out = torch.relu(out)
+        cur_frac = cur_frac - self.dw.fixed_out_shift
+
+        # SE block skipped in integer mode (would need sigmoid LUT per channel)
+
+        out = self.proj.forward_fixed_int(out, cur_frac)
+        proj_frac = cur_frac - self.proj.fixed_out_shift
+
+        if self.use_res:
+            # Align Q-formats before addition (BUG-3 fix)
+            if proj_frac < in_frac:
+                identity = identity >> (in_frac - proj_frac)
+            elif proj_frac > in_frac:
+                out = out >> (proj_frac - in_frac)
+            out = identity + out
+
         return out

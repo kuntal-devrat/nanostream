@@ -60,8 +60,17 @@ def train(args):
         opt, T_max=args.steps)
     model.train()
     running = []
+    rng = np.random.default_rng(args.seed + 42)
+    warmup_steps = min(50, args.steps // 10)
     for step in range(args.steps):
-        xs, ts = collate([ds[i] for i in range(args.batch)])
+        # BUG-11 FIX: Random sampling instead of always using indices 0..batch-1
+        indices = rng.integers(0, len(ds), size=args.batch)
+        xs, ts = collate([ds[int(i)] for i in indices])
+        # LR warmup (GAP-5 fix)
+        if step < warmup_steps:
+            warmup_factor = (step + 1) / warmup_steps
+            for pg in opt.param_groups:
+                pg['lr'] = args.lr * warmup_factor
         preds = model(xs)
         losses = detection_loss(preds, ts, model.cfg)
         opt.zero_grad()
@@ -75,6 +84,7 @@ def train(args):
                   f"loss {losses['total']:.4f} "
                   f"obj {float(losses['obj']):.4f} "
                   f"box {float(losses['box']):.4f} "
+                  f"l1 {float(losses.get('l1', 0)):.4f} "
                   f"cls {float(losses['cls']):.4f} "
                   f"pos {losses['num_pos']:.0f}")
     recall, hits, total = evaluate_recall(model)

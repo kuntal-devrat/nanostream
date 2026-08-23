@@ -1,4 +1,10 @@
-"""NanoStreamOD: patch-streaming backbone + zero-NMS dual-scale assignment head."""
+"""NanoStream-OD v3.0: patch-streaming backbone + Lite-FPN neck + zero-NMS dual-scale head.
+
+v3.0 changes:
+  - stream_forward now passes BOTH P3 and P4 features to head (BUG-1 fix)
+  - Lite-FPN neck fuses P4 semantics into P3
+  - Clean context computation
+"""
 
 import torch
 import torch.nn as nn
@@ -7,6 +13,7 @@ from . import tracker
 from .backbone import StreamingBackbone
 from .config import DEFAULT_CONFIG, NanoStreamConfig
 from .head import DualAssignHead, decode_detections
+from .neck import LiteFPN
 
 
 class NanoStreamOD(nn.Module):
@@ -17,16 +24,33 @@ class NanoStreamOD(nn.Module):
         self.backbone = StreamingBackbone(self.cfg)
         self.head = DualAssignHead(self.cfg)
 
+        # Lite-FPN neck for multi-scale feature fusion
+        neck_type = getattr(self.cfg, 'neck_type', 'lite_fpn')
+        if neck_type == "lite_fpn" and getattr(self.cfg, 'dual_scale', True):
+            self.neck = LiteFPN(self.cfg)
+        else:
+            self.neck = None
+
     def forward(self, x: torch.Tensor) -> dict:
         feats = self.backbone(x)
-        ctx = feats["ctx"] if isinstance(feats, dict) else feats.mean(dim=(2, 3))
-        preds = self.head(feats, ctx)
+        p3 = feats.get("p3", None)
+        p4 = feats["p4"]
+        ctx = feats["ctx"]
+
+        # Apply FPN neck to fuse P4 semantics into P3
+        if self.neck is not None and p3 is not None:
+            p3 = self.neck(p3, p4)
+
+        preds = self.head({"p3": p3, "p4": p4}, ctx)
         preds["G"] = self.cfg.grid_size
         return preds
 
     @torch.no_grad()
     def stream_forward(self, img: torch.Tensor, conf_thr: float = 0.30):
-        """Streaming execution path (the way the MCU runs it in strips)."""
+        """Streaming execution: MCU-matching strip pipeline.
+
+        BUG-1 FIX: Now captures and forwards P3 features to the head.
+        """
         tr = tracker.ResourceTracker.get()
         tr.start_frame()
 
@@ -53,8 +77,18 @@ class NanoStreamOD(nn.Module):
             strip = img[:, r:r + strip_h]
             self._streamer.feed_strip(strip)
 
-        grid, ctx_avg = self._streamer.finish()
-        preds = self.head(grid, ctx_avg.unsqueeze(0))
+        # BUG-1 FIX: finish() now returns (p4_grid, ctx_avg, p3_grid)
+        grid, ctx_avg, p3_grid = self._streamer.finish()
+
+        # Apply FPN neck in streaming mode
+        feats = {"p4": grid}
+        if self.neck is not None and p3_grid is not None:
+            p3_fused = self.neck(p3_grid, grid)
+            feats["p3"] = p3_fused
+        elif p3_grid is not None:
+            feats["p3"] = p3_grid
+
+        preds = self.head(feats, ctx_avg.unsqueeze(0))
         preds["G"] = self.cfg.grid_size
         dets = decode_detections(preds, conf_thr)
 
@@ -90,7 +124,7 @@ class NanoStreamOD(nn.Module):
             strip = xq[:, r:r + strip_h]
             self._int_streamer.feed_strip(strip)
 
-        grid, ctx_avg = self._int_streamer.finish()
+        grid, ctx_avg, p3_grid = self._int_streamer.finish()
         cnt = self._int_streamer.ctx_n
         ctx_sum = self._int_streamer.ctx_acc
 

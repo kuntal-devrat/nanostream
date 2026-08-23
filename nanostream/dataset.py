@@ -409,52 +409,17 @@ class RealFaceDataset(torch.utils.data.Dataset):
         boxes_px = [b[:] for b in ann["boxes"]]
 
         if self.augment:
-            # 1. Random horizontal flip
-            if self.rng.random() > 0.5:
-                img = np.flip(img, axis=1).copy()
-                boxes_px = [[w - b[2], b[1], w - b[0], b[3]] for b in boxes_px]
+            from .augment import cutout, photometric_distort, geometric_augment
+            # 1. Geometric augmentations (flip, rotate, scale, translate)
+            img, boxes_px = geometric_augment(img, boxes_px, self.img_size, rng=self.rng)
+            h, w = img.shape[:2]
 
-            # 2. Lighting & Contrast jitter (simulates dim/bright rooms, lamps)
-            alpha = self.rng.uniform(0.70, 1.40)
-            beta = self.rng.uniform(-30, 30)
-            img = np.clip(img.astype(np.float32) * alpha + beta, 0, 255).astype(np.uint8)
+            # 2. Photometric distortions (brightness, contrast, gamma, CLAHE, blur)
+            img = photometric_distort(img, rng=self.rng)
 
-            # 3. Random simulated shadow / spotlight gradient
+            # 3. CutOut / Random Erase (occlusion robustness)
             if self.rng.random() > 0.4:
-                grad_type = self.rng.integers(0, 2)
-                if grad_type == 0:  # Horizontal gradient
-                    grad = np.linspace(self.rng.uniform(0.65, 1.0), self.rng.uniform(1.0, 1.35), w).reshape(1, w)
-                    img = np.clip(img.astype(np.float32) * grad, 0, 255).astype(np.uint8)
-                elif grad_type == 1:  # Vertical gradient
-                    grad = np.linspace(self.rng.uniform(0.65, 1.0), self.rng.uniform(1.0, 1.35), h).reshape(h, 1)
-                    img = np.clip(img.astype(np.float32) * grad, 0, 255).astype(np.uint8)
-
-            # 4. Multi-scale zoom & translation (simulates near/far distance variations)
-            if self.rng.random() > 0.4 and len(boxes_px) > 0:
-                scale = self.rng.uniform(0.75, 1.28)
-                dx = int(self.rng.integers(-14, 15))
-                dy = int(self.rng.integers(-14, 15))
-                center = (w / 2, h / 2)
-                M = cv2.getRotationMatrix2D(center, 0, scale)
-                M[0, 2] += dx
-                M[1, 2] += dy
-                img = cv2.warpAffine(img, M, (w, h), borderValue=int(img.mean()))
-                new_boxes = []
-                for bx1, by1, bx2, by2 in boxes_px:
-                    pts = np.array([[bx1, by1, 1], [bx2, by2, 1]]).T
-                    trans = np.dot(M, pts)
-                    nx1 = max(0, int(min(trans[0, 0], trans[0, 1])))
-                    ny1 = max(0, int(min(trans[1, 0], trans[1, 1])))
-                    nx2 = min(w, int(max(trans[0, 0], trans[0, 1])))
-                    ny2 = min(h, int(max(trans[1, 0], trans[1, 1])))
-                    if (nx2 - nx1) > 8 and (ny2 - ny1) > 8:
-                        new_boxes.append([nx1, ny1, nx2, ny2])
-                boxes_px = new_boxes
-
-            # 5. Sensor noise
-            if self.rng.random() > 0.6:
-                noise = self.rng.normal(0, self.rng.uniform(2, 6), img.shape)
-                img = np.clip(img.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+                img = cutout(img, boxes_px, n_holes=int(self.rng.integers(1, 3)), rng=self.rng)
 
         # Normalize to [-1, 1]
         x = torch.from_numpy(img.copy()).float() / 127.5 - 1.0
@@ -462,12 +427,13 @@ class RealFaceDataset(torch.utils.data.Dataset):
 
         # Convert boxes to normalized cxcywh
         if len(boxes_px) > 0:
-            b = torch.tensor(boxes_px, dtype=torch.float32) / float(w)
+            # BUG-14 FIX: Normalize x by width and y by height separately
+            b = torch.tensor(boxes_px, dtype=torch.float32)
             cxcywh = torch.stack([
-                (b[:, 0] + b[:, 2]) / 2,
-                (b[:, 1] + b[:, 3]) / 2,
-                (b[:, 2] - b[:, 0]).clamp(min=0.04),
-                (b[:, 3] - b[:, 1]).clamp(min=0.04),
+                (b[:, 0] + b[:, 2]) / 2 / float(w),
+                (b[:, 1] + b[:, 3]) / 2 / float(h),
+                ((b[:, 2] - b[:, 0]) / float(w)).clamp(min=0.04),
+                ((b[:, 3] - b[:, 1]) / float(h)).clamp(min=0.04),
             ], dim=1)
             labels = torch.zeros(len(boxes_px), dtype=torch.long)
         else:

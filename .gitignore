@@ -25,3 +25,8 @@ Thumbs.db
 data/
 *.mp4
 *.avi
+
+# Build & packaging
+*.egg-info/
+build/
+dist/

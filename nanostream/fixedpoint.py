@@ -66,16 +66,15 @@ def calibrate_fixed_point(model, images_u8, frac_bits: int = 12,
             feats = x
         cur = frac_bits
 
-        # Stem
-        feats = model.backbone.stem.forward_fixed_int(feats, cur)
-        feats = torch.relu(feats)
-        cur = cur - model.backbone.stem.fixed_out_shift
+        # BUG-4 FIX: stem.forward_int already applies ReLU, no double-ReLU
+        feats = model.backbone.stem.forward_int(feats, cur)
+        cur = cur  # stem out_shift handled internally
 
         for blk in model.backbone.stages:
             feats = blk.forward_int(feats, cur)
             cur = cur - blk.conv.fixed_out_shift
 
-        grid = feats[0]
+        grid = feats[0] if feats.dim() == 4 else feats
         cnt = grid.shape[-1] * grid.shape[-2]
         ctx_sum = grid.sum(dim=(1, 2))
         model.head.forward_int(grid, ctx_sum.view(-1), cnt, cur)
@@ -101,7 +100,7 @@ def calibrate_fixed_point(model, images_u8, frac_bits: int = 12,
     fracs = {
         "stem": frac_bits,
     }
-    cur = frac_bits - model.backbone.stem.fixed_out_shift
+    cur = frac_bits
     for blk in model.backbone.stages:
         fracs[blk.conv._name_hint] = cur
         cur -= blk.conv.fixed_out_shift
@@ -157,7 +156,12 @@ def decode_int_detections(obj_q: torch.Tensor, box_q: torch.Tensor,
     bw = w_sig
     bh = h_sig
 
-    cls_ids = torch.zeros(ys.shape[0], dtype=torch.float32)
+    # BUG-8 FIX: Integer argmax on cls_q instead of hardcoding class 0
+    cls_vals = cls_q[:, ys, xs]  # (num_classes, N)
+    if cls_vals.shape[0] > 1:
+        cls_ids = cls_vals.argmax(dim=0).float()
+    else:
+        cls_ids = torch.zeros(ys.shape[0], dtype=torch.float32)
 
     dets = torch.stack([
         (cx - bw / 2).clamp(0.0, 1.0),

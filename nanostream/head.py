@@ -1,8 +1,11 @@
-"""Zero-NMS Dual-Scale detection head: multi-scale one-to-one dual assignment.
+"""NanoStream-OD v3.0 Detection Head: Zero-NMS Dual-Scale with CIoU + VariFocal.
 
-Each grid cell predicts at most one object. Multi-scale feature heads (P3: 20x20, P4: 10x10)
-specialize across face sizes (P3 for small/distant, P4 for large/close).
-Inference is pure direct thresholding -- no NMS sorting loop ever runs.
+v3.0 changes:
+  - CIoU loss replaces GIoU for tighter box regression (head.py)
+  - VariFocal Loss for quality-aware objectness
+  - P3 loss now includes L1 + classification (BUG-10 fix)
+  - cin_p4 uses explicit addition not multiplication (BUG-2 fix)
+  - Cross-scale duplicate suppression between P3 and P4
 """
 
 import torch
@@ -10,6 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .layers import ShiftConv2d
+from .losses import ciou_loss, varifocal_loss
 
 
 class ScaleHead(nn.Module):
@@ -47,19 +51,20 @@ class ScaleHead(nn.Module):
 
 
 class DualAssignHead(nn.Module):
-    """Multi-Scale Zero-NMS Head (P4: 10x10, P3: 20x20)."""
+    """v3.0 Multi-Scale Zero-NMS Head (P4: 10×10, P3: 20×20)."""
 
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
-        cin_p4 = cfg.stage_widths[-1] * 2
+        # BUG-2 FIX: Explicit addition, not multiplication
+        cin_p4 = cfg.stage_widths[-1] + cfg.context_dim
         cin_p3 = cfg.stage_widths[-2]
         hid = cfg.head_hidden
 
-        # P4 Head (Stride 16, 10x10)
+        # P4 Head (Stride 16, 10×10)
         self.head_p4 = ScaleHead(cin_p4, hid, cfg.num_classes, name_prefix="head")
 
-        # P3 Head (Stride 8, 20x20) for small/distant objects
+        # P3 Head (Stride 8, 20×20) for small/distant objects
         self.dual_scale = getattr(cfg, "dual_scale", True)
         if self.dual_scale:
             self.head_p3 = ScaleHead(cin_p3, hid // 2, cfg.num_classes, name_prefix="head_p3")
@@ -124,7 +129,7 @@ def magic_reciprocal(n: int, prec_bits: int = 20):
 
 
 def decode_cells(box_reg: torch.Tensor, G: int):
-    """Decode all G*G cells to absolute cxcywh boxes in [0,1] coords with scaled sigmoid."""
+    """Decode all G*G cells to absolute cxcywh boxes in [0,1] coords."""
     device = box_reg.device
     xs = torch.arange(G, device=device, dtype=torch.float32).view(1, G).expand(G, G)
     ys = torch.arange(G, device=device, dtype=torch.float32).view(G, 1).expand(G, G)
@@ -153,6 +158,7 @@ def pairwise_iou(a: torch.Tensor, b: torch.Tensor):
     return inter / union.clamp(min=1e-9)
 
 
+# Keep GIoU as fallback
 def generalized_iou_loss(pred_xyxy, tgt_xyxy):
     """Element-wise GIoU loss between matched pred-target pairs."""
     if pred_xyxy.numel() == 0:
@@ -231,7 +237,7 @@ def assign_dual(box_reg: torch.Tensor, gt_boxes: torch.Tensor, G: int):
 
 def detection_loss(preds: dict, targets: list, cfg=None, device=None,
                    w_obj: float = 2.0, w_box: float = 4.0, w_l1: float = 1.0, w_cls: float = 0.5):
-    """Computes multi-scale Zero-NMS detection loss with element-wise GIoU + L1."""
+    """v3.0 Detection loss with CIoU + VariFocal + full P3 loss (BUG-10 fix)."""
     obj_preds = preds["obj"]
     box_preds = preds["box"]
     cls_preds = preds["cls"]
@@ -255,14 +261,14 @@ def detection_loss(preds: dict, targets: list, cfg=None, device=None,
 
         assign = assign_dual(box_reg, gt_boxes, G)
 
+        # VariFocal Loss for objectness (quality-aware)
         tgt_obj = torch.zeros_like(obj_logit)
         if len(assign["prim_idx"]):
             tgt_obj[assign["prim_idx"]] = 1.0
         if len(assign["sec_idx"]):
             tgt_obj[assign["sec_idx"]] = 0.25
 
-        loss_obj = F.binary_cross_entropy_with_logits(
-            obj_logit, tgt_obj, pos_weight=torch.tensor(4.0, device=dev))
+        loss_obj = varifocal_loss(obj_logit, tgt_obj, alpha=0.75, gamma=2.0)
         total_loss_obj = total_loss_obj + loss_obj
 
         if len(assign["prim_idx"]):
@@ -275,7 +281,8 @@ def detection_loss(preds: dict, targets: list, cfg=None, device=None,
                     continue
                 p_xyxy = cxcywh_to_xyxy(pred_all[idx])
                 t_xyxy = cxcywh_to_xyxy(gt_boxes[gsel])
-                total_loss_box = total_loss_box + w * generalized_iou_loss(p_xyxy, t_xyxy)
+                # CIoU loss (replaces GIoU)
+                total_loss_box = total_loss_box + w * ciou_loss(p_xyxy, t_xyxy)
                 total_loss_l1 = total_loss_l1 + w * F.l1_loss(
                     p_xyxy.clamp(0, 1), t_xyxy.clamp(0, 1))
 
@@ -292,32 +299,55 @@ def detection_loss(preds: dict, targets: list, cfg=None, device=None,
     total_loss_l1 = total_loss_l1 / B
     total_loss_cls = total_loss_cls / B
 
-    # Also compute P3 auxiliary loss if present
+    # BUG-10 FIX: P3 loss now includes L1 + classification (not just obj + box)
+    p3_loss_weight = getattr(cfg, 'p3_loss_weight', 0.5) if cfg else 0.5
     if "p3_obj" in preds and "p3_box" in preds:
         p3_obj_preds = preds["p3_obj"]
         p3_box_preds = preds["p3_box"]
+        p3_cls_preds = preds.get("p3_cls", None)
         G_p3 = preds["G_p3"]
         loss_p3_obj = torch.tensor(0.0, device=dev)
         loss_p3_box = torch.tensor(0.0, device=dev)
+        loss_p3_l1 = torch.tensor(0.0, device=dev)
+        loss_p3_cls = torch.tensor(0.0, device=dev)
+
         for b in range(B):
             obj_l = p3_obj_preds[b, 0].reshape(-1)
             b_reg = p3_box_preds[b]
             t = targets[b]
             gt_b = t["boxes_norm"].to(dev) if len(t["boxes_norm"]) else torch.zeros(0, 4, device=dev)
+            gt_lbl = t["labels"].to(dev) if len(t["labels"]) else torch.zeros(0, dtype=torch.long, device=dev)
+
             assign_p3 = assign_dual(b_reg, gt_b, G_p3)
             tgt_p3 = torch.zeros_like(obj_l)
             if len(assign_p3["prim_idx"]):
                 tgt_p3[assign_p3["prim_idx"]] = 1.0
-            loss_p3_obj = loss_p3_obj + F.binary_cross_entropy_with_logits(
-                obj_l, tgt_p3, pos_weight=torch.tensor(4.0, device=dev))
+
+            loss_p3_obj = loss_p3_obj + varifocal_loss(obj_l, tgt_p3)
+
             if len(assign_p3["prim_idx"]):
                 p_all = decode_cells(b_reg, G_p3)
                 p_xyxy = cxcywh_to_xyxy(p_all[assign_p3["prim_idx"]])
                 t_xyxy = cxcywh_to_xyxy(gt_b[assign_p3["prim_gt"]])
-                loss_p3_box = loss_p3_box + generalized_iou_loss(p_xyxy, t_xyxy)
+                loss_p3_box = loss_p3_box + ciou_loss(p_xyxy, t_xyxy)
+                loss_p3_l1 = loss_p3_l1 + F.l1_loss(
+                    p_xyxy.clamp(0, 1), t_xyxy.clamp(0, 1))
 
-        total_loss_obj = total_loss_obj + 0.5 * (loss_p3_obj / B)
-        total_loss_box = total_loss_box + 0.5 * (loss_p3_box / B)
+                # BUG-10 FIX: Add classification loss for P3
+                if p3_cls_preds is not None:
+                    p3_cls_logit = p3_cls_preds[b]
+                    p3_labels = gt_lbl[assign_p3["prim_gt"]]
+                    K_p3 = p3_cls_logit.shape[0]
+                    p3_cls_sel = p3_cls_logit.view(K_p3, -1).t()[assign_p3["prim_idx"]]
+                    p3_smooth = torch.full_like(p3_cls_sel, 0.02)
+                    p3_smooth.scatter_(1, p3_labels.view(-1, 1), 0.98)
+                    loss_p3_cls = loss_p3_cls + F.binary_cross_entropy_with_logits(
+                        p3_cls_sel, p3_smooth)
+
+        total_loss_obj = total_loss_obj + p3_loss_weight * (loss_p3_obj / B)
+        total_loss_box = total_loss_box + p3_loss_weight * (loss_p3_box / B)
+        total_loss_l1 = total_loss_l1 + p3_loss_weight * (loss_p3_l1 / B)
+        total_loss_cls = total_loss_cls + p3_loss_weight * (loss_p3_cls / B)
 
     total = w_obj * total_loss_obj + w_box * total_loss_box + w_l1 * total_loss_l1 + w_cls * total_loss_cls
     return {
@@ -332,17 +362,12 @@ def detection_loss(preds: dict, targets: list, cfg=None, device=None,
 
 @torch.no_grad()
 def decode_detections(preds: dict, conf_thr: float = 0.30, max_det: int = 16):
-    """Direct Zero-NMS multi-scale decode with CenterNet-style 3x3 local peak suppression.
-
-    On a 10x10 grid, 3x3 local maxpool takes 0.01ms on MCU and guarantees exactly
-    one bounding box per detected object without any NMS sorting loop.
-    """
+    """Zero-NMS multi-scale decode with 3×3 local peak + cross-scale dedup."""
     all_dets = []
 
-    # 1. Decode P4 (10x10) detections with local peak suppression
+    # 1. Decode P4 (10×10)
     obj = torch.sigmoid(preds["obj"])[0, 0]
     obj_max = F.max_pool2d(obj.unsqueeze(0).unsqueeze(0), kernel_size=3, stride=1, padding=1)[0, 0]
-    # Keep only strict local peaks above confidence threshold
     mask = (obj == obj_max) & (obj > conf_thr)
     ys, xs = mask.nonzero(as_tuple=True)
     if ys.numel() > 0:
@@ -365,7 +390,7 @@ def decode_detections(preds: dict, conf_thr: float = 0.30, max_det: int = 16):
         ], dim=1)
         all_dets.append(p4_dets)
 
-    # 2. Decode P3 (20x20) detections if present
+    # 2. Decode P3 (20×20) with class argmax
     if "p3_obj" in preds and "p3_box" in preds:
         p3_obj = torch.sigmoid(preds["p3_obj"])[0, 0]
         p3_max = F.max_pool2d(p3_obj.unsqueeze(0).unsqueeze(0), kernel_size=3, stride=1, padding=1)[0, 0]
@@ -379,7 +404,12 @@ def decode_detections(preds: dict, conf_thr: float = 0.30, max_det: int = 16):
             cy_p3 = (p3_ys.float() + torch.sigmoid(p3_br[1][p3_ys, p3_xs])) / G_p3
             bw_p3 = (2.5 * torch.sigmoid(p3_br[2][p3_ys, p3_xs])).clamp(max=1.0)
             bh_p3 = (2.5 * torch.sigmoid(p3_br[3][p3_ys, p3_xs])).clamp(max=1.0)
-            p3_cls_ids = torch.zeros(p3_ys.shape[0], device=obj.device)
+            # Fix: Use class argmax instead of hardcoding class 0
+            if "p3_cls" in preds:
+                p3_cls_scores = torch.sigmoid(preds["p3_cls"][0])
+                p3_cls_ids = p3_cls_scores[:, p3_ys, p3_xs].argmax(dim=0).float()
+            else:
+                p3_cls_ids = torch.zeros(p3_ys.shape[0], device=obj.device)
             p3_dets = torch.stack([
                 (cx_p3 - bw_p3 / 2).clamp(0.0, 1.0),
                 (cy_p3 - bh_p3 / 2).clamp(0.0, 1.0),
@@ -391,8 +421,50 @@ def decode_detections(preds: dict, conf_thr: float = 0.30, max_det: int = 16):
             all_dets.append(p3_dets)
 
     if not all_dets:
-        return torch.zeros(0, 6, device=obj.device)
+        return torch.zeros(0, 6, device=preds["obj"].device)
 
     combined = torch.cat(all_dets, dim=0)
+
+    # Cross-scale duplicate suppression: if P3 and P4 both detect same object,
+    # keep the higher-confidence one
+    if len(all_dets) > 1 and combined.shape[0] > 1:
+        combined = _cross_scale_suppress(combined, iou_thr=0.5)
+
     order = torch.argsort(combined[:, 4], descending=True)[:max_det]
     return combined[order]
+
+
+def _cross_scale_suppress(dets: torch.Tensor, iou_thr: float = 0.5) -> torch.Tensor:
+    """Remove duplicate detections across P3/P4 scales via simple IoU check."""
+    if dets.shape[0] <= 1:
+        return dets
+
+    # Sort by score descending
+    order = torch.argsort(dets[:, 4], descending=True)
+    dets = dets[order]
+
+    keep = []
+    suppressed = set()
+
+    for i in range(dets.shape[0]):
+        if i in suppressed:
+            continue
+        keep.append(i)
+
+        for j in range(i + 1, dets.shape[0]):
+            if j in suppressed:
+                continue
+            # Compute IoU between i and j
+            xi1 = max(dets[i, 0].item(), dets[j, 0].item())
+            yi1 = max(dets[i, 1].item(), dets[j, 1].item())
+            xi2 = min(dets[i, 2].item(), dets[j, 2].item())
+            yi2 = min(dets[i, 3].item(), dets[j, 3].item())
+            inter = max(0, xi2 - xi1) * max(0, yi2 - yi1)
+            area_i = (dets[i, 2] - dets[i, 0]).item() * (dets[i, 3] - dets[i, 1]).item()
+            area_j = (dets[j, 2] - dets[j, 0]).item() * (dets[j, 3] - dets[j, 1]).item()
+            union = area_i + area_j - inter
+            iou = inter / max(union, 1e-9)
+            if iou > iou_thr:
+                suppressed.add(j)
+
+    return dets[keep]

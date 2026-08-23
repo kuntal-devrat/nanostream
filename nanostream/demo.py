@@ -154,7 +154,8 @@ def run_demo(args):
         ckpt = torch.load(model_path, map_location="cpu", weights_only=False)
         if "config" in ckpt:
             cfg_dict = ckpt["config"]
-            cfg = NanoStreamConfig(**{k: v for k, v in cfg_dict.items() if hasattr(DEFAULT_CONFIG, k)})
+            valid_fields = set(NanoStreamConfig.__dataclass_fields__.keys())
+            cfg = NanoStreamConfig(**{k: v for k, v in cfg_dict.items() if k in valid_fields})
             model = NanoStreamOD(cfg)
         else:
             model = NanoStreamOD()
