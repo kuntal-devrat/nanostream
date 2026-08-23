@@ -77,6 +77,27 @@ def _sample_to_tensor(img, boxes, labels, size):
     return x, to_target(boxes, labels, size)
 
 
+def _checkpoint_path(args):
+    return pathlib.Path(args.out) / f"nanostream_{args.profile}.pt"
+
+
+def _save_ckpt(path, model, opt, sched, rng, step, cfg, profile):
+    """Save full training state so a later run can resume exactly."""
+    ckpt = {
+        "model": model.state_dict(),
+        "optimizer": opt.state_dict(),
+        "scheduler": sched.state_dict(),
+        "rng_np": rng.bit_generator.state,
+        "rng_torch": torch.get_rng_state(),
+        "step": step,
+        "config": vars(cfg),
+        "classes": list(CLASS_NAMES),
+        "profile": profile,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(ckpt, path)
+
+
 def train(args):
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -99,8 +120,22 @@ def train(args):
 
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
     rng = np.random.default_rng(args.seed + 42)
+
+    ckpt_path = _checkpoint_path(args)
+    start_step = 0
+    if args.resume and ckpt_path.exists():
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model"])
+        opt.load_state_dict(ckpt["optimizer"])
+        sched.load_state_dict(ckpt["scheduler"])
+        rng.bit_generator.state = ckpt["rng_np"]
+        torch.set_rng_state(ckpt["rng_torch"])
+        start_step = int(ckpt["step"]) + 1
+        print(f"[resume] {args.profile}: continuing from step {start_step} "
+              f"(found {ckpt_path})")
+
     model.train()
-    for step in range(args.steps):
+    for step in range(start_step, args.steps):
         batch = []
         for _ in range(args.batch):
             img, boxes, labels = augment_sample(cfg, rng, args.data_len)
@@ -119,13 +154,12 @@ def train(args):
             print(f"step {step:4d}/{args.steps} loss {float(losses['total']):.3f} "
                   f"obj {float(losses['obj']):.3f} box {float(losses['box']):.3f} "
                   f"cls {float(losses['cls']):.3f} pos {losses['num_pos']:.0f}")
+        if step % args.save_every == 0 and step > start_step:
+            _save_ckpt(ckpt_path, model, opt, sched, rng, step, cfg, args.profile)
+            print(f"[ckpt] {args.profile} step {step} -> {ckpt_path}")
 
-    out = pathlib.Path(args.out)
-    out.mkdir(parents=True, exist_ok=True)
-    ckpt = {"model": model.state_dict(), "config": vars(cfg),
-            "classes": list(CLASS_NAMES), "profile": args.profile}
-    torch.save(ckpt, out / f"nanostream_{args.profile}.pt")
-    print(f"saved -> {out / f'nanostream_{args.profile}.pt'}")
+    _save_ckpt(ckpt_path, model, opt, sched, rng, args.steps - 1, cfg, args.profile)
+    print(f"saved -> {ckpt_path}")
     return model
 
 
@@ -140,6 +174,10 @@ def main():
     p.add_argument("--data_len", type=int, default=1200)
     p.add_argument("--out", type=str, default="benchmarks/runs/ckpt")
     p.add_argument("--device", type=str, default="")
+    p.add_argument("--save_every", type=int, default=500,
+                   help="checkpoint every N steps (for resume)")
+    p.add_argument("--resume", action="store_true",
+                   help="resume from existing checkpoint for this profile")
     args = p.parse_args()
     train(args)
 

@@ -130,6 +130,25 @@ def test_nanostream_trains_on_combined():
     assert losses[-1] < losses[0], f"loss did not decrease: {losses}"
 
 
+def test_nanostream_resume_continues():
+    from types import SimpleNamespace
+    from benchmarks.train_nanostream import train
+    import pathlib
+    import tempfile
+
+    out = tempfile.mkdtemp()
+    base = dict(profile="mcu", batch=4, lr=2e-3, seed=0, input_size=0,
+                data_len=200, device="cpu", out=out, save_every=6)
+    train(SimpleNamespace(steps=12, resume=False, **base))
+    ckpt_path = pathlib.Path(out) / "nanostream_mcu.pt"
+    assert ckpt_path.exists()
+    first = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    assert first["step"] == 11  # final checkpoint records the last trained step
+    train(SimpleNamespace(steps=20, resume=True, **base))
+    second = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    assert second["step"] == 19  # resumed run continued, not restarted
+
+
 def test_config_profiles_scale_capacity():
     from nanostream.config import NanoStreamConfig
     mcu = NanoStreamConfig.mcu(num_classes=4)
