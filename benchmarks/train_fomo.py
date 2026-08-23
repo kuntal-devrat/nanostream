@@ -47,7 +47,7 @@ def train(args):
         for _ in range(args.batch):
             img, boxes, labels = augment_sample(FOMO_AUG, rng, args.data_len)
             x = torch.from_numpy(img.copy()).float() / 127.5 - 1.0
-            batch.append((x.unsqueeze(0), to_target(boxes, labels, args.input_size)))
+            batch.append((x.unsqueeze(0), to_target(boxes, labels, input_size)))
         xs, ts = collate(batch)
         xs = xs.to(device)
         targets = torch.zeros(args.batch, NUM_CLASSES, model.grid, model.grid)

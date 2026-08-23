@@ -327,6 +327,8 @@ def main():
     fs.add_argument("--lr", type=float, default=2e-3)
     fs.add_argument("--seed", type=int, default=0)
     fs.add_argument("--data_len", type=int, default=1200)
+    fs.add_argument("--width", type=float, default=0.75)
+    fs.add_argument("--input_size", type=int, default=160)
     fs.add_argument("--out", type=str, default=str(CKPT_DIR))
     fs.add_argument("--device", type=str, default="", help="torch device (cuda/cpu)")
     py = sub.add_parser("train-yolo")
