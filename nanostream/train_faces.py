@@ -173,7 +173,7 @@ def train_faces(args):
 
         opt.zero_grad()
         preds = model(xs)
-        losses = detection_loss(preds, ts, cfg, w_obj=3.0, w_box=3.0, w_l1=1.0, w_cls=0.5)
+        losses = detection_loss(preds, ts, cfg, w_obj=2.0, w_box=3.0, w_l1=1.5, w_cls=0.5)
 
         losses["total"].backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)

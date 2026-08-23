@@ -8,6 +8,7 @@ v3.0 changes:
   - Cross-scale duplicate suppression between P3 and P4
 """
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -26,6 +27,15 @@ class ScaleHead(nn.Module):
         self.obj = ShiftConv2d(hid, 1, 1).name(f"{name_prefix}_obj")
         self.box = ShiftConv2d(hid, 4, 1).name(f"{name_prefix}_box")
         self.cls = ShiftConv2d(hid, num_classes, 1).name(f"{name_prefix}_cls")
+
+        # Stable prior initialization (RetinaNet/YOLO standard)
+        if self.obj.bias is not None:
+            self.obj.bias.data.fill_(-2.19)  # prior p ~ 0.10 to prevent background gradient explosion
+        if self.box.bias is not None:
+            self.box.bias.data[0] = 0.0      # center x prior
+            self.box.bias.data[1] = 0.0      # center y prior
+            self.box.bias.data[2] = -1.2     # width prior ~ 0.35 (avoids 1.0 screen-filling default)
+            self.box.bias.data[3] = -1.2     # height prior ~ 0.35
 
     def frozen_pairs(self):
         return [(self.conv1, self.bn1), (self.obj, None),
@@ -183,61 +193,70 @@ def generalized_iou_loss(pred_xyxy, tgt_xyxy):
 
 @torch.no_grad()
 def assign_dual(box_reg: torch.Tensor, gt_boxes: torch.Tensor, G: int):
-    """One primary + one secondary cell per GT."""
+    """Deterministic spatial center assignment (YOLOv8 style).
+
+    Assigns the grid cell containing each GT center as Primary (1.0 weight)
+    and the 1-2 nearest adjacent spatial neighbors as Secondary (0.5 weight).
+    Deterministic: never oscillates or shifts due to model weight updates!
+    """
     device = box_reg.device
     n_cells = G * G
-    all_cells = decode_cells(box_reg, G)
-    centers = all_cells[:, :2]
-    corners = cxcywh_to_xyxy(all_cells)
+    prim_idx, prim_gt = [], []
+    sec_idx, sec_gt = [], []
+    used_primary = set()
 
-    prim_idx, prim_gt, sec_idx, sec_gt = [], [], [], []
-    used = set()
     for gi in range(gt_boxes.shape[0]):
         gcx, gcy, gw, gh = gt_boxes[gi].tolist()
-        inside = ((centers[:, 0] - gcx).abs() < gw / 2) & \
-                 ((centers[:, 1] - gcy).abs() < gh / 2)
-        if not bool(inside.any()):
-            d = (centers - torch.tensor([gcx, gcy], device=device)).norm(dim=1)
-            if used:
-                d[torch.tensor(sorted(used), dtype=torch.long, device=device)] = float("inf")
-            ranked = [(int(d.argmin()), 0.0)]
-        else:
-            gt_xyxy = cxcywh_to_xyxy(gt_boxes[gi:gi + 1])
-            ious = pairwise_iou(corners[inside], gt_xyxy)[0]
-            order = torch.argsort(ious, descending=True)
-            cell_ids = inside.nonzero(as_tuple=True)[0][order]
-            ranked = [(int(c), float(ious[o]))
-                      for o, c in zip(order.tolist(), cell_ids.tolist())]
+        if gw <= 0 or gh <= 0:
+            continue
 
-        picked = 0
-        for c, sc in ranked:
-            if c in used:
-                continue
-            if picked == 0:
-                prim_idx.append(c)
-                prim_gt.append(gi)
-                used.add(c)
-                picked += 1
-            elif picked == 1:
-                sec_idx.append(c)
+        # Map to grid coordinates [0, G]
+        cx_grid = gcx * G
+        cy_grid = gcy * G
+
+        col = int(min(max(0, math.floor(cx_grid)), G - 1))
+        row = int(min(max(0, math.floor(cy_grid)), G - 1))
+        primary_cell = row * G + col
+
+        if primary_cell not in used_primary:
+            prim_idx.append(primary_cell)
+            prim_gt.append(gi)
+            used_primary.add(primary_cell)
+
+        # Nearest adjacent neighbors based on sub-cell offset
+        sub_x = cx_grid - (col + 0.5)
+        sub_y = cy_grid - (row + 0.5)
+
+        neighbors = []
+        if sub_x > 0.05 and col + 1 < G:
+            neighbors.append((row, col + 1))
+        elif sub_x < -0.05 and col - 1 >= 0:
+            neighbors.append((row, col - 1))
+
+        if sub_y > 0.05 and row + 1 < G:
+            neighbors.append((row + 1, col))
+        elif sub_y < -0.05 and row - 1 >= 0:
+            neighbors.append((row - 1, col))
+
+        for nr, nc in neighbors:
+            n_cell = nr * G + nc
+            if n_cell not in used_primary and n_cell not in sec_idx:
+                sec_idx.append(n_cell)
                 sec_gt.append(gi)
-                used.add(c)
-                picked += 1
-            else:
-                break
 
     return {
         "prim_idx": torch.tensor(prim_idx or [], dtype=torch.long, device=device),
         "prim_gt": torch.tensor(prim_gt or [], dtype=torch.long, device=device),
         "sec_idx": torch.tensor(sec_idx or [], dtype=torch.long, device=device),
         "sec_gt": torch.tensor(sec_gt or [], dtype=torch.long, device=device),
-        "num_cells": n_cells, "G": G,
+        "num_cells": n_cells,
+        "G": G,
     }
 
 
 def detection_loss(preds: dict, targets: list, cfg=None, device=None,
-                   w_obj: float = 2.0, w_box: float = 4.0, w_l1: float = 1.0, w_cls: float = 0.5):
-    """v3.0 Detection loss with CIoU + VariFocal + full P3 loss (BUG-10 fix)."""
+                   w_obj: float = 2.0, w_box: float = 3.0, w_l1: float = 1.5, w_cls: float = 0.5):
+    """v3.0 Detection loss with stable Smooth-L1 + CIoU and deterministic assignment."""
     obj_preds = preds["obj"]
     box_preds = preds["box"]
     cls_preds = preds["cls"]
@@ -261,12 +280,12 @@ def detection_loss(preds: dict, targets: list, cfg=None, device=None,
 
         assign = assign_dual(box_reg, gt_boxes, G)
 
-        # VariFocal Loss for objectness (quality-aware)
+        # VariFocal / Quality-aware objectness target
         tgt_obj = torch.zeros_like(obj_logit)
         if len(assign["prim_idx"]):
             tgt_obj[assign["prim_idx"]] = 1.0
         if len(assign["sec_idx"]):
-            tgt_obj[assign["sec_idx"]] = 0.25
+            tgt_obj[assign["sec_idx"]] = 0.5
 
         loss_obj = varifocal_loss(obj_logit, tgt_obj, alpha=0.75, gamma=2.0)
         total_loss_obj = total_loss_obj + loss_obj
@@ -274,17 +293,21 @@ def detection_loss(preds: dict, targets: list, cfg=None, device=None,
         if len(assign["prim_idx"]):
             pred_all = decode_cells(box_reg, G)
             for idx_key, gt_key, w in (("prim_idx", "prim_gt", 1.0),
-                                       ("sec_idx", "sec_gt", 0.20)):
+                                       ("sec_idx", "sec_gt", 0.5)):
                 idx = assign[idx_key]
                 gsel = assign[gt_key]
                 if len(idx) == 0:
                     continue
-                p_xyxy = cxcywh_to_xyxy(pred_all[idx])
-                t_xyxy = cxcywh_to_xyxy(gt_boxes[gsel])
-                # CIoU loss (replaces GIoU)
+                p_cxcywh = pred_all[idx]
+                t_cxcywh = gt_boxes[gsel]
+                p_xyxy = cxcywh_to_xyxy(p_cxcywh)
+                t_xyxy = cxcywh_to_xyxy(t_cxcywh)
+
+                # CIoU loss
                 total_loss_box = total_loss_box + w * ciou_loss(p_xyxy, t_xyxy)
-                total_loss_l1 = total_loss_l1 + w * F.l1_loss(
-                    p_xyxy.clamp(0, 1), t_xyxy.clamp(0, 1))
+                # Smooth L1 on cxcywh for smooth non-saturating gradients
+                total_loss_l1 = total_loss_l1 + w * F.smooth_l1_loss(
+                    p_cxcywh, t_cxcywh, beta=0.05)
 
             labels = gt_labels[assign["prim_gt"]]
             K = cls_logit.shape[0]
@@ -299,7 +322,7 @@ def detection_loss(preds: dict, targets: list, cfg=None, device=None,
     total_loss_l1 = total_loss_l1 / B
     total_loss_cls = total_loss_cls / B
 
-    # BUG-10 FIX: P3 loss now includes L1 + classification (not just obj + box)
+    # P3 auxiliary loss
     p3_loss_weight = getattr(cfg, 'p3_loss_weight', 0.5) if cfg else 0.5
     if "p3_obj" in preds and "p3_box" in preds:
         p3_obj_preds = preds["p3_obj"]
@@ -322,18 +345,28 @@ def detection_loss(preds: dict, targets: list, cfg=None, device=None,
             tgt_p3 = torch.zeros_like(obj_l)
             if len(assign_p3["prim_idx"]):
                 tgt_p3[assign_p3["prim_idx"]] = 1.0
+            if len(assign_p3["sec_idx"]):
+                tgt_p3[assign_p3["sec_idx"]] = 0.5
 
             loss_p3_obj = loss_p3_obj + varifocal_loss(obj_l, tgt_p3)
 
             if len(assign_p3["prim_idx"]):
                 p_all = decode_cells(b_reg, G_p3)
-                p_xyxy = cxcywh_to_xyxy(p_all[assign_p3["prim_idx"]])
-                t_xyxy = cxcywh_to_xyxy(gt_b[assign_p3["prim_gt"]])
-                loss_p3_box = loss_p3_box + ciou_loss(p_xyxy, t_xyxy)
-                loss_p3_l1 = loss_p3_l1 + F.l1_loss(
-                    p_xyxy.clamp(0, 1), t_xyxy.clamp(0, 1))
+                for idx_key, gt_key, w in (("prim_idx", "prim_gt", 1.0),
+                                           ("sec_idx", "sec_gt", 0.5)):
+                    idx_p3 = assign_p3[idx_key]
+                    gsel_p3 = assign_p3[gt_key]
+                    if len(idx_p3) == 0:
+                        continue
+                    p3_cxcywh = p_all[idx_p3]
+                    t3_cxcywh = gt_b[gsel_p3]
+                    p_xyxy = cxcywh_to_xyxy(p3_cxcywh)
+                    t_xyxy = cxcywh_to_xyxy(t3_cxcywh)
 
-                # BUG-10 FIX: Add classification loss for P3
+                    loss_p3_box = loss_p3_box + w * ciou_loss(p_xyxy, t_xyxy)
+                    loss_p3_l1 = loss_p3_l1 + w * F.smooth_l1_loss(
+                        p3_cxcywh, t3_cxcywh, beta=0.05)
+
                 if p3_cls_preds is not None:
                     p3_cls_logit = p3_cls_preds[b]
                     p3_labels = gt_lbl[assign_p3["prim_gt"]]
