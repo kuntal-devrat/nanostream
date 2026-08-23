@@ -78,7 +78,9 @@ def _sample_to_tensor(img, boxes, labels, size):
 
 
 def _checkpoint_path(args):
-    return pathlib.Path(args.out) / f"nanostream_{args.profile}.pt"
+    out = getattr(args, "out", "benchmarks/runs/ckpt")
+    prof = getattr(args, "profile", "mcu")
+    return pathlib.Path(out) / f"nanostream_{prof}.pt"
 
 
 def _save_ckpt(path, model, opt, sched, rng, step, cfg, profile):
