@@ -320,6 +320,8 @@ def main():
     ns.add_argument("--lr", type=float, default=2e-3)
     ns.add_argument("--seed", type=int, default=0)
     ns.add_argument("--data_len", type=int, default=1200)
+    ns.add_argument("--save_every", type=int, default=500)
+    ns.add_argument("--resume", action="store_true")
     ns.add_argument("--out", type=str, default=str(CKPT_DIR))
     ns.add_argument("--device", type=str, default="", help="torch device (cuda/cpu)")
     fs = sub.add_parser("train-fomo")

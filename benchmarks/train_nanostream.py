@@ -140,11 +140,16 @@ def train(args):
         print(f"[resume] {args.profile}: continuing from step {start_step} "
               f"(found {ckpt_path})")
 
+    steps = getattr(args, "steps", 1000)
+    batch_size = getattr(args, "batch", 16)
+    data_len = getattr(args, "data_len", 1200)
+    save_every = getattr(args, "save_every", 500)
+
     model.train()
-    for step in range(start_step, args.steps):
+    for step in range(start_step, steps):
         batch = []
-        for _ in range(args.batch):
-            img, boxes, labels = augment_sample(cfg, rng, args.data_len)
+        for _ in range(batch_size):
+            img, boxes, labels = augment_sample(cfg, rng, data_len)
             batch.append(_sample_to_tensor(img, boxes, labels, cfg.input_size))
         xs, ts = collate(batch)
         xs = xs.to(device)
@@ -156,15 +161,15 @@ def train(args):
         torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
         opt.step()
         sched.step()
-        if step % 100 == 0 or step == args.steps - 1:
-            print(f"step {step:4d}/{args.steps} loss {float(losses['total']):.3f} "
+        if step % 100 == 0 or step == steps - 1:
+            print(f"step {step:4d}/{steps} loss {float(losses['total']):.3f} "
                   f"obj {float(losses['obj']):.3f} box {float(losses['box']):.3f} "
                   f"cls {float(losses['cls']):.3f} pos {losses['num_pos']:.0f}")
-        if step % args.save_every == 0 and step > start_step:
-            _save_ckpt(ckpt_path, model, opt, sched, rng, step, cfg, args.profile)
-            print(f"[ckpt] {args.profile} step {step} -> {ckpt_path}")
+        if save_every and step % save_every == 0 and step > start_step:
+            _save_ckpt(ckpt_path, model, opt, sched, rng, step, cfg, profile)
+            print(f"[ckpt] {profile} step {step} -> {ckpt_path}")
 
-    _save_ckpt(ckpt_path, model, opt, sched, rng, args.steps - 1, cfg, args.profile)
+    _save_ckpt(ckpt_path, model, opt, sched, rng, steps - 1, cfg, profile)
     print(f"saved -> {ckpt_path}")
     return model
 
