@@ -100,7 +100,25 @@ def _save_ckpt(path, model, opt, sched, rng, step, cfg, profile):
     torch.save(ckpt, path)
 
 
+class BenchmarkDataset(torch.utils.data.Dataset):
+    """Parallelized on-the-fly dataset for multi-worker GPU feeding."""
+    def __init__(self, cfg, data_len, total_samples, seed=42):
+        self.cfg = cfg
+        self.data_len = data_len
+        self.total_samples = total_samples
+        self.seed = seed
+
+    def __len__(self):
+        return self.total_samples
+
+    def __getitem__(self, idx):
+        rng = np.random.default_rng(self.seed + 1000 + idx)
+        img, boxes, labels = augment_sample(self.cfg, rng, self.data_len)
+        return _sample_to_tensor(img, boxes, labels, self.cfg.input_size)
+
+
 def train(args):
+    import os
     seed = getattr(args, "seed", 0)
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -137,7 +155,7 @@ def train(args):
         rng.bit_generator.state = ckpt["rng_np"]
         torch.set_rng_state(ckpt["rng_torch"])
         start_step = int(ckpt["step"]) + 1
-        print(f"[resume] {args.profile}: continuing from step {start_step} "
+        print(f"[resume] {profile}: continuing from step {start_step} "
               f"(found {ckpt_path})")
 
     steps = getattr(args, "steps", 1000)
@@ -145,26 +163,64 @@ def train(args):
     data_len = getattr(args, "data_len", 1200)
     save_every = getattr(args, "save_every", 500)
 
+    # Multi-worker prefetching DataLoader for high-throughput GPU saturation
+    dataset = BenchmarkDataset(cfg, data_len=data_len, total_samples=steps * batch_size, seed=seed)
+    num_workers = min(4, os.cpu_count() or 1) if device.type == "cuda" else 0
+    loader = torch.utils.data.DataLoader(
+        dataset, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, pin_memory=(device.type == "cuda"),
+        collate_fn=collate, prefetch_factor=2 if num_workers > 0 else None
+    )
+
+    use_amp = (device.type == "cuda")
+    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+        scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
+        autocast_ctx = lambda: torch.amp.autocast('cuda', enabled=use_amp)
+    else:
+        scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+        autocast_ctx = lambda: torch.cuda.amp.autocast(enabled=use_amp)
+
     model.train()
+    data_iter = iter(loader)
+
+    # Skip already-trained batches if resumed
+    if start_step > 0:
+        for _ in range(start_step):
+            try:
+                next(data_iter)
+            except StopIteration:
+                break
+
     for step in range(start_step, steps):
-        batch = []
-        for _ in range(batch_size):
-            img, boxes, labels = augment_sample(cfg, rng, data_len)
-            batch.append(_sample_to_tensor(img, boxes, labels, cfg.input_size))
-        xs, ts = collate(batch)
-        xs = xs.to(device)
-        ts = [{k: v.to(device) for k, v in t.items()} for t in ts]
-        preds = model(xs)
-        losses = detection_loss(preds, ts, cfg)
-        opt.zero_grad()
-        losses["total"].backward()
+        try:
+            xs, ts = next(data_iter)
+        except StopIteration:
+            data_iter = iter(loader)
+            xs, ts = next(data_iter)
+
+        xs = xs.to(device, non_blocking=True)
+        ts = [{k: v.to(device, non_blocking=True) for k, v in t.items()} for t in ts]
+
+        opt.zero_grad(set_to_none=True)
+        with autocast_ctx():
+            preds = model(xs)
+            losses = detection_loss(preds, ts, cfg)
+
+        scaler.scale(losses["total"]).backward()
+        scaler.unscale_(opt)
         torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-        opt.step()
+        scaler.step(opt)
+        scaler.update()
         sched.step()
+
         if step % 100 == 0 or step == steps - 1:
-            print(f"step {step:4d}/{steps} loss {float(losses['total']):.3f} "
-                  f"obj {float(losses['obj']):.3f} box {float(losses['box']):.3f} "
-                  f"cls {float(losses['cls']):.3f} pos {losses['num_pos']:.0f}")
+            tot = float(losses['total'].detach())
+            obj_l = float(losses['obj'].detach())
+            box_l = float(losses['box'].detach())
+            cls_l = float(losses['cls'].detach())
+            print(f"step {step:4d}/{steps} loss {tot:.3f} "
+                  f"obj {obj_l:.3f} box {box_l:.3f} "
+                  f"cls {cls_l:.3f} pos {losses['num_pos']:.0f}")
         if save_every and step % save_every == 0 and step > start_step:
             _save_ckpt(ckpt_path, model, opt, sched, rng, step, cfg, profile)
             print(f"[ckpt] {profile} step {step} -> {ckpt_path}")
