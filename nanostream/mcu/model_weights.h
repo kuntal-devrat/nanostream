@@ -20,8 +20,10 @@
 #define NS_INPUT_FRAC       12
 #define NS_RECIP_M          167772
 #define NS_RECIP_S          24
-
+#define NS_BOX_SCALE_NUM    5
 #define NS_HEAD_OUT_FRAC    11
+#define NS_BOX_SCALE_DEN    2
+
 /* Buffer sizing constants */
 #define NS_RING_ELEMS       16384
 #define NS_WIN_ELEMS        8192

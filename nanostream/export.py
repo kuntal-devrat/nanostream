@@ -74,6 +74,8 @@ def export_c_header(model: NanoStreamOD, calib_fracs: dict, out_path: str | path
         f"#define NS_INPUT_FRAC       {calib_fracs['input_frac']}",
         f"#define NS_RECIP_M          {recip_m}",
         f"#define NS_RECIP_S          {recip_s}",
+        f"#define NS_BOX_SCALE_NUM    5",
+        f"#define NS_BOX_SCALE_DEN    2",
         "",
         "/* Buffer sizing constants */",
         "#define NS_RING_ELEMS       16384",

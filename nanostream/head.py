@@ -124,14 +124,14 @@ def magic_reciprocal(n: int, prec_bits: int = 20):
 
 
 def decode_cells(box_reg: torch.Tensor, G: int):
-    """Decode all G*G cells to absolute cxcywh boxes in [0,1] coords."""
+    """Decode all G*G cells to absolute cxcywh boxes in [0,1] coords with scaled sigmoid."""
     device = box_reg.device
     xs = torch.arange(G, device=device, dtype=torch.float32).view(1, G).expand(G, G)
     ys = torch.arange(G, device=device, dtype=torch.float32).view(G, 1).expand(G, G)
     cx = (xs + torch.sigmoid(box_reg[0])) / G
     cy = (ys + torch.sigmoid(box_reg[1])) / G
-    w = torch.sigmoid(box_reg[2])
-    h = torch.sigmoid(box_reg[3])
+    w = (2.5 * torch.sigmoid(box_reg[2])).clamp(max=1.0)
+    h = (2.5 * torch.sigmoid(box_reg[3])).clamp(max=1.0)
     return torch.stack([cx, cy, w, h], dim=-1).view(-1, 4)
 
 
@@ -230,7 +230,7 @@ def assign_dual(box_reg: torch.Tensor, gt_boxes: torch.Tensor, G: int):
 
 
 def detection_loss(preds: dict, targets: list, cfg=None, device=None,
-                   w_obj: float = 3.0, w_box: float = 3.0, w_l1: float = 1.0, w_cls: float = 0.5):
+                   w_obj: float = 2.0, w_box: float = 4.0, w_l1: float = 1.0, w_cls: float = 0.5):
     """Computes multi-scale Zero-NMS detection loss with element-wise GIoU + L1."""
     obj_preds = preds["obj"]
     box_preds = preds["box"]
@@ -351,8 +351,8 @@ def decode_detections(preds: dict, conf_thr: float = 0.30, max_det: int = 16):
         br = preds["box"][0]
         cx = (xs.float() + torch.sigmoid(br[0][ys, xs])) / G
         cy = (ys.float() + torch.sigmoid(br[1][ys, xs])) / G
-        bw = torch.sigmoid(br[2][ys, xs])
-        bh = torch.sigmoid(br[3][ys, xs])
+        bw = (2.5 * torch.sigmoid(br[2][ys, xs])).clamp(max=1.0)
+        bh = (2.5 * torch.sigmoid(br[3][ys, xs])).clamp(max=1.0)
         cls_scores = torch.sigmoid(preds["cls"][0])
         cls_ids = cls_scores[:, ys, xs].argmax(dim=0)
         p4_dets = torch.stack([
@@ -377,8 +377,8 @@ def decode_detections(preds: dict, conf_thr: float = 0.30, max_det: int = 16):
             p3_br = preds["p3_box"][0]
             cx_p3 = (p3_xs.float() + torch.sigmoid(p3_br[0][p3_ys, p3_xs])) / G_p3
             cy_p3 = (p3_ys.float() + torch.sigmoid(p3_br[1][p3_ys, p3_xs])) / G_p3
-            bw_p3 = torch.sigmoid(p3_br[2][p3_ys, p3_xs])
-            bh_p3 = torch.sigmoid(p3_br[3][p3_ys, p3_xs])
+            bw_p3 = (2.5 * torch.sigmoid(p3_br[2][p3_ys, p3_xs])).clamp(max=1.0)
+            bh_p3 = (2.5 * torch.sigmoid(p3_br[3][p3_ys, p3_xs])).clamp(max=1.0)
             p3_cls_ids = torch.zeros(p3_ys.shape[0], device=obj.device)
             p3_dets = torch.stack([
                 (cx_p3 - bw_p3 / 2).clamp(0.0, 1.0),

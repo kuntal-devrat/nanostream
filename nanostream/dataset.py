@@ -429,11 +429,11 @@ class RealFaceDataset(torch.utils.data.Dataset):
                     grad = np.linspace(self.rng.uniform(0.65, 1.0), self.rng.uniform(1.0, 1.35), h).reshape(h, 1)
                     img = np.clip(img.astype(np.float32) * grad, 0, 255).astype(np.uint8)
 
-            # 4. Small random scale & translation
-            if self.rng.random() > 0.5 and len(boxes_px) > 0:
-                scale = self.rng.uniform(0.92, 1.08)
-                dx = int(self.rng.integers(-6, 7))
-                dy = int(self.rng.integers(-6, 7))
+            # 4. Multi-scale zoom & translation (simulates near/far distance variations)
+            if self.rng.random() > 0.4 and len(boxes_px) > 0:
+                scale = self.rng.uniform(0.75, 1.28)
+                dx = int(self.rng.integers(-14, 15))
+                dy = int(self.rng.integers(-14, 15))
                 center = (w / 2, h / 2)
                 M = cv2.getRotationMatrix2D(center, 0, scale)
                 M[0, 2] += dx

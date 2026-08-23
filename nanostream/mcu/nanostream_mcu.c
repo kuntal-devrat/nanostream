@@ -280,11 +280,13 @@ int ns_decode(ns_det_t *dets, int max_det, int conf_thr_q15) {
             int16_t sw = ns_sig_q15((int32_t)g_box[2][cell] << up);
             int16_t sh = ns_sig_q15((int32_t)g_box[3][cell] << up);
 
-            /* Q12 coordinates [0, 4096] */
+            /* Q12 coordinates [0, 4096] with 2.5x box scale */
             int32_t cx = ((int32_t)(col << 12) + (sx >> 3)) / NS_GRID;
             int32_t cy = ((int32_t)(row << 12) + (sy >> 3)) / NS_GRID;
-            int32_t w = sw >> 3;
-            int32_t h = sh >> 3;
+            int32_t w = ((int32_t)(sw >> 3) * NS_BOX_SCALE_NUM) / NS_BOX_SCALE_DEN;
+            int32_t h = ((int32_t)(sh >> 3) * NS_BOX_SCALE_NUM) / NS_BOX_SCALE_DEN;
+            if (w > 4096) w = 4096;
+            if (h > 4096) h = 4096;
 
             int32_t x1 = cx - w / 2;
             int32_t y1 = cy - h / 2;

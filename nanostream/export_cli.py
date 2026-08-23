@@ -12,7 +12,7 @@ from .model import NanoStreamOD
 
 def main():
     p = argparse.ArgumentParser(description="Export NanoStream-OD model to static C header (model_weights.h)")
-    p.add_argument("--model", type=str, default="runs/shapes/nanostream_shapes.pt",
+    p.add_argument("--model", type=str, default="runs/faces/nanostream_faces.pt",
                    help="Path to trained PyTorch checkpoint (.pt)")
     p.add_argument("--out", type=str, default="nanostream/mcu/model_weights.h",
                    help="Output path for generated C header")
@@ -22,22 +22,14 @@ def main():
                    help="Input fractional bits (default 12 for Q12)")
     args = p.parse_args()
 
+    from .api import load_model
     model_path = pathlib.Path(args.model)
     if model_path.exists():
-        ckpt = torch.load(model_path, map_location="cpu", weights_only=False)
-        if "config" in ckpt:
-            from .config import DEFAULT_CONFIG, NanoStreamConfig
-            cfg_dict = ckpt["config"]
-            cfg = NanoStreamConfig(**{k: v for k, v in cfg_dict.items() if hasattr(DEFAULT_CONFIG, k)})
-            model = NanoStreamOD(cfg)
-        else:
-            model = NanoStreamOD()
-        state_dict = ckpt["model"] if "model" in ckpt else ckpt
-        model.load_state_dict(state_dict)
+        model = load_model(model_path, device="cpu")
         print(f"Loaded weights from {model_path}")
     else:
         model = NanoStreamOD()
-        print(f"Model checkpoint not found at {model_path}, using randomly initialized weights for export demo.")
+        print(f"Model checkpoint not found at {model_path}, using default initialized weights for export demo.")
 
     model.eval()
     print("Calibrating fixed-point dynamic ranges...")
