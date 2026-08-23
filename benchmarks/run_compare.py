@@ -258,7 +258,12 @@ def cmd_eval(_args):
         lines.append(f"YOLO baseline skipped (ultralytics unavailable: {e})")
 
     # --- face detection demo (mcu model) ---
-    _render_face_demo(_load_nanostream("mcu"), fomo)
+    try:
+        ns_mcu = _load_nanostream("mcu")
+    except FileNotFoundError:
+        lines.append("face demo skipped (no mcu checkpoint yet)")
+    else:
+        _render_face_demo(ns_mcu, fomo)
 
     RUNS.mkdir(parents=True, exist_ok=True)
     (RUNS / "results.json").write_text(json.dumps(results, indent=2))
