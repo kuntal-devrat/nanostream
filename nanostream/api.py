@@ -155,6 +155,8 @@ def detect(model: NanoStreamOD,
     """
     x, _ = preprocess_image(image, target_size=model.cfg.input_size)
     class_names = getattr(model, "class_names", CLASS_NAMES)
+    device = next(model.parameters()).device
+    x = x.to(device)
 
     if use_streaming:
         dets_t, _ = model.stream_forward(x.squeeze(0), conf_thr=conf_thr)

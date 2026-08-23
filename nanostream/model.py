@@ -39,6 +39,9 @@ class NanoStreamOD(nn.Module):
         else:
             self._streamer.reset()
 
+        device = next(self.parameters()).device
+        img = img.to(device)
+
         if img.dim() == 2:
             img = img.unsqueeze(0)  # (1, H, W)
         elif img.dim() == 3 and img.shape[0] != 1 and img.shape[0] != self.cfg.in_channels:
