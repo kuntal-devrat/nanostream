@@ -75,6 +75,7 @@ def load_model(checkpoint_path: Union[str, pathlib.Path] = None,
     if checkpoint_path is None:
         candidates = [
             pathlib.Path("runs/faces/nanostream_faces.pt"),
+            pathlib.Path("runs/faces_colab/nanostream_faces.pt"),
             pathlib.Path("runs/shapes/nanostream_shapes.pt"),
         ]
         for c in candidates:
@@ -82,34 +83,34 @@ def load_model(checkpoint_path: Union[str, pathlib.Path] = None,
                 checkpoint_path = c
                 break
 
-    if checkpoint_path is not None and pathlib.Path(checkpoint_path).exists():
-        ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-        if "config" in ckpt:
-            cfg_dict = ckpt["config"]
-            valid_fields = set(NanoStreamConfig.__dataclass_fields__.keys())
-            cfg = NanoStreamConfig(**{k: v for k, v in cfg_dict.items() if k in valid_fields})
-            model = NanoStreamOD(cfg)
-        else:
-            model = NanoStreamOD()
+    if checkpoint_path is None or not pathlib.Path(checkpoint_path).exists():
+        raise FileNotFoundError(
+            f"❌ Checkpoint file not found: '{checkpoint_path}'.\n"
+            f"You must train the model first before testing it!\n"
+            f"Run:\n"
+            f"    python -m nanostream.train_faces --steps 2000 --batch 16"
+        )
 
-        state_dict = ckpt["model"] if "model" in ckpt else ckpt
-        try:
-            model.load_state_dict(state_dict, strict=True)
-            print(f"✅ Successfully loaded trained checkpoint from: {checkpoint_path}")
-        except Exception as e:
-            try:
-                model.load_state_dict(state_dict, strict=False)
-                print(f"⚠️ Loaded checkpoint with non-strict matching from: {checkpoint_path}")
-            except Exception as e2:
-                print(f"❌ Failed to load checkpoint weights: {e2}")
-
-        if "classes" in ckpt:
-            model.class_names = tuple(ckpt["classes"])
-        else:
-            model.class_names = CLASS_NAMES
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    if "config" in ckpt:
+        cfg_dict = ckpt["config"]
+        valid_fields = set(NanoStreamConfig.__dataclass_fields__.keys())
+        cfg = NanoStreamConfig(**{k: v for k, v in cfg_dict.items() if k in valid_fields})
+        model = NanoStreamOD(cfg)
     else:
-        print(f"⚠️ Warning: No trained checkpoint found at '{checkpoint_path}'. Using randomly initialized weights!")
         model = NanoStreamOD()
+
+    state_dict = ckpt["model"] if "model" in ckpt else ckpt
+    try:
+        model.load_state_dict(state_dict, strict=True)
+        print(f"✅ Successfully loaded trained checkpoint from: {checkpoint_path}")
+    except Exception as e:
+        model.load_state_dict(state_dict, strict=False)
+        print(f"⚠️ Loaded checkpoint with non-strict matching from: {checkpoint_path}")
+
+    if "classes" in ckpt:
+        model.class_names = tuple(ckpt["classes"])
+    else:
         model.class_names = CLASS_NAMES
 
     model.to(device)
