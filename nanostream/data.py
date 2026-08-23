@@ -89,16 +89,13 @@ class SyntheticShapes(torch.utils.data.Dataset):
         self.size = size
         self.seed = seed
         self.max_objects = max_objects
-        # FIX: one RNG per sample index, so __getitem__ is deterministic and
-        # reproducible across runs/epochs (previously it re-rolled a shared RNG
-        # on every access and ignored idx entirely).
-        self._rngs = [np.random.default_rng(seed + 1000 + i) for i in range(length)]
 
     def __len__(self):
         return self.length
 
     def __getitem__(self, idx):
-        rng = self._rngs[idx % self.length]
+        # OPT-6: Seeded on-the-fly per index for zero memory overhead and exact reproducibility
+        rng = np.random.default_rng(self.seed + 1000 + (idx % self.length))
         img, boxes, labels = make_sample(self.size, self.max_objects, rng)
         x = torch.from_numpy(img.copy()).float() / 127.5 - 1.0
         x = x.unsqueeze(0)

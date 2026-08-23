@@ -178,6 +178,7 @@ def make_face_sample(size=160, max_faces=2, rng=None):
 
     n_faces = int(rng.integers(1, max_faces + 1))
     for _ in range(n_faces):
+        ok = False
         for _attempt in range(10):
             # Scale variations: 32px to 80px
             face_w = int(rng.integers(32, int(size * 0.52)))
@@ -193,6 +194,7 @@ def make_face_sample(size=160, max_faces=2, rng=None):
             # Non-overlap check — FIX: _draw_face returns bbox cx±1.05rx, so the
             # candidate must use the same 1.05 margin or adjacent faces can pass
             # the check yet still overlap in the drawn region.
+            ok = True
             m = 1.05
             for (bx1, by1, bx2, by2) in boxes:
                 cand_x1, cand_y1 = cx - int(rx * m), cy - int(ry * m)
@@ -224,14 +226,16 @@ class SyntheticFaces(torch.utils.data.Dataset):
     def __init__(self, length=1024, size=160, seed=42, max_faces=2):
         self.length = length
         self.size = size
-        self.rng = np.random.default_rng(seed)
+        self.seed = seed
         self.max_faces = max_faces
 
     def __len__(self):
         return self.length
 
     def __getitem__(self, idx):
-        img, boxes, labels = make_face_sample(self.size, self.max_faces, self.rng)
+        # Deterministic per-index RNG for zero memory overhead
+        rng = np.random.default_rng(self.seed + 1000 + (idx % self.length))
+        img, boxes, labels = make_face_sample(self.size, self.max_faces, rng)
         # Normalize [-1, 1]
         x = torch.from_numpy(img.copy()).float() / 127.5 - 1.0
         x = x.unsqueeze(0)

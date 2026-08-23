@@ -30,7 +30,7 @@ class ShiftConv2d(nn.Module):
         self.padding = self.kernel_size[0] // 2
         self.weight = nn.Parameter(
             torch.empty(out_channels, in_channels // groups, *self.kernel_size))
-        nn.init.kaiming_uniform_(self.weight, a=5 ** 0.5)
+        nn.init.kaiming_uniform_(self.weight, a=0)  # a=0 for ReLU (was sqrt(5))
         if bias:
             self.bias = nn.Parameter(torch.zeros(out_channels))
         else:
@@ -95,17 +95,24 @@ class ShiftConv2d(nn.Module):
         if self.groups == 1:
             for ky in range(Kh):
                 for kx in range(Kw):
+                    # patch: (B, Cin, H_out, W_out)
                     patch = xp[:, :, ky:ky + H_out * s:s, kx:kx + W_out * s:s]
-                    for oc in range(self.out_channels):
-                        eo = E[oc, :, ky, kx]
-                        so = S[oc, :, ky, kx]
-                        for ev in torch.unique(eo).tolist():
-                            if ev <= ZERO_EXP:
-                                continue
-                            sel = eo == ev
-                            signed = _ishift(patch[:, sel], int(ev)) * \
-                                so[sel].view(1, -1, 1, 1)
-                            acc[:, oc] += signed.sum(1)
+                    # E_tap: (Cout, Cin), S_tap: (Cout, Cin)
+                    E_tap = E[:, :, ky, kx]
+                    S_tap = S[:, :, ky, kx]
+                    # OPT-1: Vectorize across all output channels per unique
+                    # exponent — eliminates the per-oc Python loop.
+                    for ev in torch.unique(E_tap).tolist():
+                        if ev <= ZERO_EXP:
+                            continue
+                        mask = (E_tap == ev)  # (Cout, Cin) bool
+                        shifted = _ishift(patch, int(ev))  # (B, Cin, H_out, W_out)
+                        # Signed shifted: (B, Cin, H_out, W_out) * (Cout, Cin, 1, 1)
+                        # Mask selects which (oc, ic) taps have this exponent
+                        # For each oc, sum the contributing input channels
+                        S_masked = (S_tap * mask).unsqueeze(0).unsqueeze(-1).unsqueeze(-1)  # (1, Cout, Cin, 1, 1)
+                        contrib = shifted.unsqueeze(1) * S_masked  # (B, Cout, Cin, H_out, W_out)
+                        acc += contrib.sum(2)  # (B, Cout, H_out, W_out)
         else:
             # Depthwise grouped convolution
             c_per_g = self.in_channels // self.groups
@@ -233,8 +240,6 @@ class InvertedResidualBlock(nn.Module):
         self.stride = stride
         self.use_res = (stride == 1 and cin == cout)
         hidden = int(round(cin * expand_ratio))
-
-        layers = []
 
         # 1×1 Pointwise Expansion (skip if ratio == 1)
         if expand_ratio != 1:

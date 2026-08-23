@@ -69,11 +69,13 @@ def calibrate_fixed_point(model, images_u8, frac_bits: int = 12,
 
         # BUG-4 FIX: stem.forward_int already applies ReLU, no double-ReLU
         feats = model.backbone.stem.forward_int(feats, cur)
-        cur = cur  # stem out_shift handled internally
+        cur = cur - model.backbone.stem.conv.fixed_out_shift
 
         for blk in model.backbone.stages:
             feats = blk.forward_int(feats, cur)
-            cur = cur - blk.conv.fixed_out_shift
+            out_f = cur - blk.conv.fixed_out_shift
+            ref_f = out_f - blk.refine.fixed_out_shift
+            cur = min(out_f, ref_f)
 
         grid = feats[0] if feats.dim() == 4 else feats
         cnt = grid.shape[-1] * grid.shape[-2]
@@ -101,10 +103,15 @@ def calibrate_fixed_point(model, images_u8, frac_bits: int = 12,
     fracs = {
         "stem": frac_bits,
     }
-    cur = frac_bits
-    for blk in model.backbone.stages:
+    cur = frac_bits - model.backbone.stem.conv.fixed_out_shift
+    p3_frac = cur
+    for i, blk in enumerate(model.backbone.stages):
         fracs[blk.conv._name_hint] = cur
-        cur -= blk.conv.fixed_out_shift
+        out_f = cur - blk.conv.fixed_out_shift
+        ref_f = out_f - blk.refine.fixed_out_shift
+        cur = min(out_f, ref_f)
+        if i == 1:  # stage2 output is the P3 feature map
+            p3_frac = cur
 
     head_fracs = {}
     hf = cur
@@ -116,14 +123,6 @@ def calibrate_fixed_point(model, images_u8, frac_bits: int = 12,
             hf -= conv.fixed_out_shift
         else:
             head_fracs[cname] = hf
-
-    # P3 grid (stage2 output) input fraction for neck + P3 head parity.
-    # stage2 is backbone.stages[1]; its output fraction = input - conv shift.
-    p3_frac = frac_bits
-    for i, blk in enumerate(model.backbone.stages):
-        p3_frac -= blk.conv.fixed_out_shift
-        if i == 1:  # stage2 output is the P3 feature map
-            break
 
     return {"input_frac": frac_bits, "stage_in_frac": fracs,
             "head_in_frac": head_fracs, "p3_in_frac": p3_frac}

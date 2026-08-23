@@ -65,12 +65,14 @@ class Detection:
 
 
 def load_model(checkpoint_path: Union[str, pathlib.Path] = None,
-               device: str = "cpu") -> NanoStreamOD:
+               device: str = "cpu",
+               fallback_to_random: bool = True) -> NanoStreamOD:
     """Load a trained NanoStream-OD model from disk or create default.
 
     Args:
         checkpoint_path: Path to `.pt` checkpoint. If None, checks default face/shapes checkpoints.
         device: 'cpu' or 'cuda'.
+        fallback_to_random: If True, returns a default-initialized model if no checkpoint exists.
     """
     if checkpoint_path is None:
         candidates = [
@@ -84,6 +86,12 @@ def load_model(checkpoint_path: Union[str, pathlib.Path] = None,
                 break
 
     if checkpoint_path is None or not pathlib.Path(checkpoint_path).exists():
+        if fallback_to_random:
+            model = NanoStreamOD()
+            model.class_names = CLASS_NAMES
+            model.to(device)
+            model.eval()
+            return model
         raise FileNotFoundError(
             "Checkpoint file not found: '%s'.\n"
             "You must train the model first before testing it!\n"

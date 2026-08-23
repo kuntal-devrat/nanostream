@@ -25,6 +25,7 @@ dependencies = [
 
 [project.optional-dependencies]
 demo = ["opencv-python>=4.8"]
+train = ["opencv-python>=4.8"]
 dev = ["pytest>=7"]
 
 [project.scripts]
@@ -40,3 +41,4 @@ include = ["nanostream*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]

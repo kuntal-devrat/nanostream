@@ -92,9 +92,11 @@ static void ns_conv_window(const ns_layer_t *L,
                             int8_t e = L->exp[tap];
                             if (e == NS_TAP_OFF) continue;
                             int16_t x = win[(iy * L->cin + ic) * Win + ix];
-                            int16_t t = (e >= 0) ? (int16_t)(x << e)
-                                                 : (int16_t)(x >> (-e));
-                            acc += (L->sgn[tap] > 0) ? t : -(int32_t)t;
+                            int32_t t32 = (e >= 0) ? ((int32_t)x << e)
+                                                   : ((int32_t)x >> (-e));
+                            if (t32 > 32767) t32 = 32767;
+                            if (t32 < -32768) t32 = -32768;
+                            acc += (L->sgn[tap] > 0) ? t32 : -t32;
                         }
                     }
                 }
@@ -121,9 +123,11 @@ static void ns_conv1x1(const ns_layer_t *L,
                 int8_t e = L->exp[tap];
                 if (e == NS_TAP_OFF) continue;
                 int16_t x = in_flat[ic][cell];
-                int16_t t = (e >= 0) ? (int16_t)(x << e)
-                                     : (int16_t)(x >> (-e));
-                acc += (L->sgn[tap] > 0) ? t : -(int32_t)t;
+                int32_t t32 = (e >= 0) ? ((int32_t)x << e)
+                                       : ((int32_t)x >> (-e));
+                if (t32 > 32767) t32 = 32767;
+                if (t32 < -32768) t32 = -32768;
+                acc += (L->sgn[tap] > 0) ? t32 : -t32;
             }
             int32_t y = acc >> L->out_shift;
             if (relu && y < 0) y = 0;

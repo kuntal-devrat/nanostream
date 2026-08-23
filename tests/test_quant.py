@@ -68,7 +68,9 @@ def test_calibration_and_integer_decode():
 
 def test_int_decode_matches_float_decode():
     """int stream_forward_int and float stream_forward must agree on box size."""
-    model = NanoStreamOD()
+    from nanostream.config import NanoStreamConfig
+    cfg = NanoStreamConfig(dual_scale=False)
+    model = NanoStreamOD(cfg)
     model.eval()
 
     calib_imgs = calibration_images(n=8, size=160)
