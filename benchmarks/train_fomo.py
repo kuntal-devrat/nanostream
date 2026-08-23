@@ -20,12 +20,16 @@ FOMO_AUG = SimpleNamespace(input_size=160, augment_mosaic=True,
 
 
 def train(args):
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
-    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    seed = getattr(args, "seed", 0)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    dev_str = getattr(args, "device", "") or ("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(dev_str)
 
-    model = FomoDetector(num_classes=NUM_CLASSES, width_mult=args.width,
-                         img_size=args.input_size).to(device)
+    width = getattr(args, "width", 0.5)
+    input_size = getattr(args, "input_size", 160)
+    model = FomoDetector(num_classes=NUM_CLASSES, width_mult=width,
+                         img_size=input_size).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=5e-4)
     warmup = min(50, args.steps // 10)
 

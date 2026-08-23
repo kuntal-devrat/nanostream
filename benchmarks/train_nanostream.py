@@ -99,11 +99,14 @@ def _save_ckpt(path, model, opt, sched, rng, step, cfg, profile):
 
 
 def train(args):
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
-    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    seed = getattr(args, "seed", 0)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    dev_str = getattr(args, "device", "") or ("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(dev_str)
 
-    cfg = PROFILES[args.profile](num_classes=NUM_CLASSES)
+    profile = getattr(args, "profile", "mcu")
+    cfg = PROFILES[profile](num_classes=NUM_CLASSES)
     input_size = getattr(args, "input_size", 0)
     if input_size:
         cfg.input_size = input_size
@@ -119,11 +122,12 @@ def train(args):
         return max(0.01, 0.5 * (1.0 + np.cos(np.pi * prog)))
 
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
-    rng = np.random.default_rng(args.seed + 42)
+    rng = np.random.default_rng(seed + 42)
 
     ckpt_path = _checkpoint_path(args)
     start_step = 0
-    if args.resume and ckpt_path.exists():
+    resume = getattr(args, "resume", False)
+    if resume and ckpt_path.exists():
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model"])
         opt.load_state_dict(ckpt["optimizer"])
