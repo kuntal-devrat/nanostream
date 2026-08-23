@@ -14,9 +14,9 @@ try:
 except ImportError:
     cv2 = None
 
-from .config import DEFAULT_CONFIG, NanoStreamConfig
+from .config import NanoStreamConfig
 from .data import CLASS_NAMES, calibration_images, render_frame_webcam_like
-from .faces import FACE_CLASSES, make_face_sample
+from .faces import make_face_sample
 from .fixedpoint import calibrate_fixed_point
 from .model import NanoStreamOD
 from .tracker import ResourceTracker, enable_windows_ansi, print_dashboard
@@ -166,7 +166,7 @@ def run_demo(args):
         print(f"Loaded checkpoint: {model_path} (Classes: {classes})")
     else:
         model = NanoStreamOD()
-        print(f"No checkpoint found. Using random weights (train first!).")
+        print("No checkpoint found. Using random weights (train first!).")
 
     model.eval()
 
@@ -185,7 +185,6 @@ def run_demo(args):
         print("Calibrating fixed-point dynamic ranges for integer execution...")
         calib_imgs = calibration_images(n=24, size=model.cfg.input_size)
         calib_fracs = calibrate_fixed_point(model, calib_imgs, frac_bits=model.cfg.frac_bits)
-
     # Initialize video capture
     cap = None
     use_synthetic = args.synthetic
@@ -281,9 +280,10 @@ def run_demo(args):
 
             summary = tr.summary()
 
-            # Terminal Dashboard
+            # Terminal Dashboard (FIX: scale by model.cfg.input_size, not 160)
+            inp = model.cfg.input_size
             dash_dets = [
-                (d[0] * 160, d[1] * 160, d[2] * 160, d[3] * 160, d[4],
+                (d[0] * inp, d[1] * inp, d[2] * inp, d[3] * inp, d[4],
                  classes[d[5]] if d[5] < len(classes) else str(d[5]))
                 for d in dets_list
             ]

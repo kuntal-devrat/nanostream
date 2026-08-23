@@ -100,7 +100,13 @@ class NanoStreamOD(nn.Module):
     @torch.no_grad()
     def stream_forward_int(self, img_u8: torch.Tensor, fracs: dict,
                            conf_thr: float = 0.30):
-        """Bit-exact integer streaming path (mirrors the C MCU kernel)."""
+        """Bit-exact integer streaming path (mirrors the C MCU kernel).
+
+        NOTE: like the exported C kernel, this path is single-scale P4 only
+        (10x10 grid, stride 16). The P3 head and Lite-FPN neck are float-only
+        features; the MCU artifact intentionally runs the P4 head so that
+        Python-int and C outputs agree bit-for-bit.
+        """
         from .fixedpoint import decode_int_detections, quantize_input_u8
         tr = tracker.ResourceTracker.get()
         tr.start_frame()
@@ -128,7 +134,9 @@ class NanoStreamOD(nn.Module):
         cnt = self._int_streamer.ctx_n
         ctx_sum = self._int_streamer.ctx_acc
 
-        head_frac = fracs["head_in_frac"].get("head1", fracs["head_in_frac"].get("head_p41", 12))
+        # FIX: head_in_frac always contains "head1" (set by calibrate_fixed_point);
+        # the old fallback chain referenced a non-existent "head_p41" key.
+        head_frac = fracs["head_in_frac"]["head1"]
         obj_q, box_q, cls_q, out_frac = self.head.forward_int(
             grid[0], ctx_sum.view(-1).to(torch.int64), cnt, head_frac)
 

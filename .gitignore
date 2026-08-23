@@ -30,3 +30,13 @@ data/
 *.egg-info/
 build/
 dist/
+
+# Tooling indexes
+.superbrain/
+.ruff_cache/
+
+# Training / benchmark artifacts (regenerable via scripts or Colab)
+runs/detect/
+runs/shapes_smoke/
+benchmarks/runs/
+yolov8n.pt

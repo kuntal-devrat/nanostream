@@ -55,6 +55,28 @@ int main(void) {
                i + 1, dets[i].cls, score, x1, y1, x2, y2);
     }
 
-    printf("MCU verification complete. Peak SRAM bounded within <256 KB.\n");
+    /* Report the ACTUAL static BSS footprint, computed purely from the
+     * generated buffer defines (rings/win/cas) plus the fixed grid arrays.
+     * All sizes match nanostream_mcu.c's static declarations. */
+    static const long ring_elems[NS_STAGES] = {
+        NS_RING_ELEMS_0, NS_RING_ELEMS_1, NS_RING_ELEMS_2, NS_RING_ELEMS_3};
+    static const long win_elems[NS_STAGES] = {
+        NS_WIN_ELEMS_0, NS_WIN_ELEMS_1, NS_WIN_ELEMS_2, NS_WIN_ELEMS_3};
+    static const long cas_elems[NS_STAGES] = {
+        NS_CAS_ELEMS_0, NS_CAS_ELEMS_1, NS_CAS_ELEMS_2, NS_CAS_ELEMS_3};
+
+    long bss_bytes = 0;
+    for (int i = 0; i < NS_STAGES; i++) {
+        bss_bytes += (ring_elems[i] + win_elems[i] + cas_elems[i]) * (long)sizeof(int16_t);
+    }
+    long cells = (long)NS_GRID * NS_GRID;
+    bss_bytes += (NS_CG + NS_HEAD1_CIN + NS_HID + 1 + 4 + NS_NUM_CLASSES) * cells
+               * (long)sizeof(int16_t);          /* g_grid + g_comb + g_h + obj/box/cls */
+    bss_bytes += NS_CG * (long)sizeof(int32_t);  /* g_ctx_sum */
+    bss_bytes += (long)NS_STRIP_ROWS * NS_INPUT_SIZE * (long)sizeof(int16_t); /* input strip */
+
+    printf("Static BSS: %ld bytes (%.1f KB) -- within 256 KB budget: %s\n",
+           bss_bytes, bss_bytes / 1024.0,
+           (bss_bytes < 256L * 1024L) ? "YES" : "NO");
     return 0;
 }

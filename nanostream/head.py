@@ -14,7 +14,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .layers import ShiftConv2d
-from .losses import ciou_loss, varifocal_loss
+from .losses import ciou_loss, scale_aware_assign, varifocal_loss
 
 
 class ScaleHead(nn.Module):
@@ -98,6 +98,7 @@ class DualAssignHead(nn.Module):
             feat_p3 = None
 
         B, _, G = feat_p4.shape[0], feat_p4.shape[1], feat_p4.shape[-1]
+        _ = B  # batch dim unused in this branch (kept for clarity)
         ctx_map = ctx.view(ctx.shape[0], -1, 1, 1).expand(-1, -1, G, G)
         x_p4 = torch.cat([feat_p4, ctx_map], dim=1)
         out_p4 = self.head_p4(x_p4)
@@ -168,29 +169,6 @@ def pairwise_iou(a: torch.Tensor, b: torch.Tensor):
     return inter / union.clamp(min=1e-9)
 
 
-# Keep GIoU as fallback
-def generalized_iou_loss(pred_xyxy, tgt_xyxy):
-    """Element-wise GIoU loss between matched pred-target pairs."""
-    if pred_xyxy.numel() == 0:
-        return pred_xyxy.sum() * 0.0
-    lt = torch.maximum(pred_xyxy[:, :2], tgt_xyxy[:, :2])
-    rb = torch.minimum(pred_xyxy[:, 2:], tgt_xyxy[:, 2:])
-    wh = (rb - lt).clamp(min=0)
-    inter = wh[:, 0] * wh[:, 1]
-
-    area_p = (pred_xyxy[:, 2] - pred_xyxy[:, 0]) * (pred_xyxy[:, 3] - pred_xyxy[:, 1])
-    area_t = (tgt_xyxy[:, 2] - tgt_xyxy[:, 0]) * (tgt_xyxy[:, 3] - tgt_xyxy[:, 1])
-    union = (area_p + area_t - inter).clamp(min=1e-9)
-    iou = inter / union
-
-    lt_c = torch.minimum(pred_xyxy[:, :2], tgt_xyxy[:, :2])
-    rb_c = torch.maximum(pred_xyxy[:, 2:], tgt_xyxy[:, 2:])
-    wh_c = (rb_c - lt_c).clamp(min=0)
-    c_area = (wh_c[:, 0] * wh_c[:, 1]).clamp(min=1e-9)
-    giou = iou - (c_area - union) / c_area
-    return (1 - giou).mean()
-
-
 @torch.no_grad()
 def assign_dual(box_reg: torch.Tensor, gt_boxes: torch.Tensor, G: int):
     """Deterministic spatial center assignment (YOLOv8 style).
@@ -203,7 +181,21 @@ def assign_dual(box_reg: torch.Tensor, gt_boxes: torch.Tensor, G: int):
     n_cells = G * G
     prim_idx, prim_gt = [], []
     sec_idx, sec_gt = [], []
-    used_primary = set()
+    used = set()
+
+    def _nearest_free(row, col):
+        """Nearest unused cell (ring search radius 1..G) or None if grid is full."""
+        for rad in range(1, G + 1):
+            for dr in range(-rad, rad + 1):
+                for dc in range(-rad, rad + 1):
+                    if abs(dr) != rad and abs(dc) != rad:
+                        continue
+                    nr, nc = row + dr, col + dc
+                    if 0 <= nr < G and 0 <= nc < G:
+                        cell = nr * G + nc
+                        if cell not in used:
+                            return cell
+        return None
 
     for gi in range(gt_boxes.shape[0]):
         gcx, gcy, gw, gh = gt_boxes[gi].tolist()
@@ -218,12 +210,26 @@ def assign_dual(box_reg: torch.Tensor, gt_boxes: torch.Tensor, G: int):
         row = int(min(max(0, math.floor(cy_grid)), G - 1))
         primary_cell = row * G + col
 
-        if primary_cell not in used_primary:
+        # FIX: crowded scenes used to silently DROP a GT when its primary cell
+        # was taken. Now we fall back to the nearest free cell so every GT gets
+        # at least one positive cell (never a zero-gradient box).
+        if primary_cell in used:
+            primary_cell = _nearest_free(row, col)
+        if primary_cell is not None:
             prim_idx.append(primary_cell)
             prim_gt.append(gi)
-            used_primary.add(primary_cell)
+            used.add(primary_cell)
 
-        # Nearest adjacent neighbors based on sub-cell offset
+    # Secondaries: pick adjacent cells in the direction of the sub-cell offset;
+    # never steal a cell already used (primary of any GT, or secondary of another).
+    for gi in range(gt_boxes.shape[0]):
+        gcx, gcy, gw, gh = gt_boxes[gi].tolist()
+        if gw <= 0 or gh <= 0:
+            continue
+        cx_grid = gcx * G
+        cy_grid = gcy * G
+        col = int(min(max(0, math.floor(cx_grid)), G - 1))
+        row = int(min(max(0, math.floor(cy_grid)), G - 1))
         sub_x = cx_grid - (col + 0.5)
         sub_y = cy_grid - (row + 0.5)
 
@@ -240,7 +246,7 @@ def assign_dual(box_reg: torch.Tensor, gt_boxes: torch.Tensor, G: int):
 
         for nr, nc in neighbors:
             n_cell = nr * G + nc
-            if n_cell not in used_primary and n_cell not in sec_idx:
+            if n_cell not in used and n_cell not in sec_idx:
                 sec_idx.append(n_cell)
                 sec_gt.append(gi)
 
@@ -254,9 +260,39 @@ def assign_dual(box_reg: torch.Tensor, gt_boxes: torch.Tensor, G: int):
     }
 
 
+@torch.no_grad()
+def _iou_quality_targets(box_reg: torch.Tensor, assign: dict,
+                         gt_boxes: torch.Tensor, G: int,
+                         sec_scale: float = 0.5) -> torch.Tensor:
+    """VariFocal quality targets: predicted-IoU for positives, 0 elsewhere.
+
+    FIX: the old code used hard 0.5/1.0 labels, so the quality-aware half of
+    varifocal_loss was never exercised. Real VFL uses the IoU between the
+    decoded prediction and its assigned GT as the learning target.
+    """
+    tgt_obj = torch.zeros(G * G, device=box_reg.device)
+    idx = torch.cat([assign["prim_idx"], assign["sec_idx"]])
+    gsel = torch.cat([assign["prim_gt"], assign["sec_gt"]])
+    if idx.numel() == 0 or gt_boxes.numel() == 0:
+        return tgt_obj
+    pred_all = decode_cells(box_reg, G)          # (G*G, 4) cxcywh
+    p_xyxy = cxcywh_to_xyxy(pred_all[idx])
+    t_xyxy = cxcywh_to_xyxy(gt_boxes[gsel])
+    ious = pairwise_iou(p_xyxy, t_xyxy).diag()  # per-assignment IoU
+    n_prim = assign["prim_idx"].numel()
+    is_sec = torch.arange(idx.numel(), device=idx.device) >= n_prim
+    quality = torch.where(is_sec, ious * sec_scale, ious)
+    tgt_obj[idx] = quality
+    return tgt_obj
+
+
 def detection_loss(preds: dict, targets: list, cfg=None, device=None,
                    w_obj: float = 2.0, w_box: float = 3.0, w_l1: float = 1.5, w_cls: float = 0.5):
-    """v3.0 Detection loss with stable Smooth-L1 + CIoU and deterministic assignment."""
+    """v3.0 Detection loss: CIoU + Smooth-L1 + VariFocal + label smoothing.
+
+    Scale-aware dual assignment: small objects are supervised by P3 (stride 8),
+    large objects by P4 (stride 16), medium by both (scale_aware_assign).
+    """
     obj_preds = preds["obj"]
     box_preds = preds["box"]
     cls_preds = preds["cls"]
@@ -278,15 +314,14 @@ def detection_loss(preds: dict, targets: list, cfg=None, device=None,
         gt_boxes = t["boxes_norm"].to(dev) if len(t["boxes_norm"]) else torch.zeros(0, 4, device=dev)
         gt_labels = t["labels"].to(dev) if len(t["labels"]) else torch.zeros(0, dtype=torch.long, device=dev)
 
+        # Dual-scale supervision: BOTH heads see ALL objects (YOLOv8-style).
+        # scale_aware_assign is kept as a utility but splitting GT by size
+        # starves one head when the dataset is size-homogeneous (e.g. the
+        # shapes set, whose objects are all "small" by the 0.25 threshold).
         assign = assign_dual(box_reg, gt_boxes, G)
 
-        # VariFocal / Quality-aware objectness target
-        tgt_obj = torch.zeros_like(obj_logit)
-        if len(assign["prim_idx"]):
-            tgt_obj[assign["prim_idx"]] = 1.0
-        if len(assign["sec_idx"]):
-            tgt_obj[assign["sec_idx"]] = 0.5
-
+        # VariFocal quality-aware objectness target (predicted-IoU, not 0/1)
+        tgt_obj = _iou_quality_targets(box_reg, assign, gt_boxes, G)
         loss_obj = varifocal_loss(obj_logit, tgt_obj, alpha=0.75, gamma=2.0)
         total_loss_obj = total_loss_obj + loss_obj
 
@@ -322,7 +357,7 @@ def detection_loss(preds: dict, targets: list, cfg=None, device=None,
     total_loss_l1 = total_loss_l1 / B
     total_loss_cls = total_loss_cls / B
 
-    # P3 auxiliary loss
+    # P3 auxiliary loss (small/medium objects only)
     p3_loss_weight = getattr(cfg, 'p3_loss_weight', 0.5) if cfg else 0.5
     if "p3_obj" in preds and "p3_box" in preds:
         p3_obj_preds = preds["p3_obj"]
@@ -341,13 +376,12 @@ def detection_loss(preds: dict, targets: list, cfg=None, device=None,
             gt_b = t["boxes_norm"].to(dev) if len(t["boxes_norm"]) else torch.zeros(0, 4, device=dev)
             gt_lbl = t["labels"].to(dev) if len(t["labels"]) else torch.zeros(0, dtype=torch.long, device=dev)
 
-            assign_p3 = assign_dual(b_reg, gt_b, G_p3)
-            tgt_p3 = torch.zeros_like(obj_l)
-            if len(assign_p3["prim_idx"]):
-                tgt_p3[assign_p3["prim_idx"]] = 1.0
-            if len(assign_p3["sec_idx"]):
-                tgt_p3[assign_p3["sec_idx"]] = 0.5
+            p3_mask, _ = scale_aware_assign(gt_b, G_p3, G)
+            gt_b_p3 = gt_b[p3_mask] if gt_b.numel() else gt_b
+            gt_lbl_p3 = gt_lbl[p3_mask] if gt_lbl.numel() else gt_lbl
 
+            assign_p3 = assign_dual(b_reg, gt_b_p3, G_p3)
+            tgt_p3 = _iou_quality_targets(b_reg, assign_p3, gt_b_p3, G_p3)
             loss_p3_obj = loss_p3_obj + varifocal_loss(obj_l, tgt_p3)
 
             if len(assign_p3["prim_idx"]):
@@ -359,7 +393,7 @@ def detection_loss(preds: dict, targets: list, cfg=None, device=None,
                     if len(idx_p3) == 0:
                         continue
                     p3_cxcywh = p_all[idx_p3]
-                    t3_cxcywh = gt_b[gsel_p3]
+                    t3_cxcywh = gt_b_p3[gsel_p3]
                     p_xyxy = cxcywh_to_xyxy(p3_cxcywh)
                     t_xyxy = cxcywh_to_xyxy(t3_cxcywh)
 
@@ -369,7 +403,7 @@ def detection_loss(preds: dict, targets: list, cfg=None, device=None,
 
                 if p3_cls_preds is not None:
                     p3_cls_logit = p3_cls_preds[b]
-                    p3_labels = gt_lbl[assign_p3["prim_gt"]]
+                    p3_labels = gt_lbl_p3[assign_p3["prim_gt"]]
                     K_p3 = p3_cls_logit.shape[0]
                     p3_cls_sel = p3_cls_logit.view(K_p3, -1).t()[assign_p3["prim_idx"]]
                     p3_smooth = torch.full_like(p3_cls_sel, 0.02)
@@ -458,46 +492,42 @@ def decode_detections(preds: dict, conf_thr: float = 0.30, max_det: int = 16):
 
     combined = torch.cat(all_dets, dim=0)
 
-    # Cross-scale duplicate suppression: if P3 and P4 both detect same object,
-    # keep the higher-confidence one
+    # Cross-scale duplicate suppression: if P3 and P4 both detect the same
+    # object, keep the higher-confidence one. Class-aware (FIX: the old
+    # implementation removed overlapping detections of DIFFERENT classes,
+    # and ran an O(n^2) Python loop with per-element .item() CPU syncs).
     if len(all_dets) > 1 and combined.shape[0] > 1:
-        combined = _cross_scale_suppress(combined, iou_thr=0.5)
+        combined = _class_aware_dedup(combined, iou_thr=0.5)
 
     order = torch.argsort(combined[:, 4], descending=True)[:max_det]
     return combined[order]
 
 
-def _cross_scale_suppress(dets: torch.Tensor, iou_thr: float = 0.5) -> torch.Tensor:
-    """Remove duplicate detections across P3/P4 scales via simple IoU check."""
+def _class_aware_dedup(dets: torch.Tensor, iou_thr: float = 0.5) -> torch.Tensor:
+    """Greedy NMS that only suppresses detections of the SAME class.
+
+    Vectorized over boxes (no .item() per pair); the per-class greedy loop is
+    bounded by the (small) detection count, never the grid size.
+    """
     if dets.shape[0] <= 1:
         return dets
 
-    # Sort by score descending
     order = torch.argsort(dets[:, 4], descending=True)
     dets = dets[order]
+    keep = torch.ones(dets.shape[0], dtype=torch.bool, device=dets.device)
 
-    keep = []
-    suppressed = set()
-
-    for i in range(dets.shape[0]):
-        if i in suppressed:
+    for c in torch.unique(dets[:, 5]):
+        idx = (dets[:, 5] == c).nonzero(as_tuple=True)[0]
+        if idx.numel() <= 1:
             continue
-        keep.append(i)
-
-        for j in range(i + 1, dets.shape[0]):
-            if j in suppressed:
+        boxes = dets[idx, :4]
+        ious = pairwise_iou(boxes, boxes)          # (N, N) tensor, no CPU sync
+        suppressed = torch.zeros(idx.numel(), dtype=torch.bool, device=dets.device)
+        for a in range(idx.numel()):
+            if suppressed[a]:
                 continue
-            # Compute IoU between i and j
-            xi1 = max(dets[i, 0].item(), dets[j, 0].item())
-            yi1 = max(dets[i, 1].item(), dets[j, 1].item())
-            xi2 = min(dets[i, 2].item(), dets[j, 2].item())
-            yi2 = min(dets[i, 3].item(), dets[j, 3].item())
-            inter = max(0, xi2 - xi1) * max(0, yi2 - yi1)
-            area_i = (dets[i, 2] - dets[i, 0]).item() * (dets[i, 3] - dets[i, 1]).item()
-            area_j = (dets[j, 2] - dets[j, 0]).item() * (dets[j, 3] - dets[j, 1]).item()
-            union = area_i + area_j - inter
-            iou = inter / max(union, 1e-9)
-            if iou > iou_thr:
-                suppressed.add(j)
+            suppressed |= ious[a] > iou_thr        # lower-score dupes after a
+            suppressed[a] = False
+        keep[idx] &= ~suppressed
 
     return dets[keep]

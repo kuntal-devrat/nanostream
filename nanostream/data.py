@@ -87,15 +87,19 @@ class SyntheticShapes(torch.utils.data.Dataset):
     def __init__(self, length=512, size=160, seed=0, max_objects=3):
         self.length = length
         self.size = size
-        self.rng = np.random.default_rng(seed)
+        self.seed = seed
         self.max_objects = max_objects
+        # FIX: one RNG per sample index, so __getitem__ is deterministic and
+        # reproducible across runs/epochs (previously it re-rolled a shared RNG
+        # on every access and ignored idx entirely).
+        self._rngs = [np.random.default_rng(seed + 1000 + i) for i in range(length)]
 
     def __len__(self):
         return self.length
 
     def __getitem__(self, idx):
-        img, boxes, labels = make_sample(self.size, self.max_objects,
-                                         self.rng)
+        rng = self._rngs[idx % self.length]
+        img, boxes, labels = make_sample(self.size, self.max_objects, rng)
         x = torch.from_numpy(img.copy()).float() / 127.5 - 1.0
         x = x.unsqueeze(0)
         tgt = to_target(boxes, labels, self.size)
@@ -112,6 +116,8 @@ def calibration_images(n=48, size=160, seed=1234):
     imgs = []
     for _ in range(n):
         img, _, _ = make_sample(size, 3, rng)
+        # FIX: return the SAME uint8 range the real pipeline feeds the model
+        # (0-255 pixels); calibrate_fixed_point quantizes via quantize_input_u8.
         imgs.append(torch.from_numpy(img))
     return imgs
 

@@ -8,7 +8,9 @@ two), every effective weight is exactly +/-2^k. A convolution degenerates to
 import torch
 
 
-ZERO_EXP = -99
+# Sentinel for zero taps. MUST equal NS_TAP_OFF in nanostream/mcu/nanostream_mcu.h
+# so the C kernel's "skip zero tap" branch actually fires (was -99 -> UB shift).
+ZERO_EXP = -128
 
 
 class Pow2Weight:

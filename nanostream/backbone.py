@@ -334,22 +334,23 @@ class PatchStreamer:
         """Flush all stages, collecting remaining P3 and P4 features."""
         for i in range(len(self.stream_stages) - 1):
             tail = self.stream_stages[i].flush()
-            if tail is not None and tail.shape[1] > 0:
-                cur = tail
-                for j in range(i + 1, len(self.stream_stages)):
-                    prev_cur = cur
-                    cur = self.stream_stages[j].push(cur)
-
-                    # BUG-1 FIX: Capture P3 from stage2 during flush
-                    if j == 2 and cur is not None and cur.shape[1] > 0:
-                        self._collect_p3(cur.clone())
-
-                    if cur is None or cur.shape[1] == 0:
-                        cur = None
-                        break
-
-                if cur is not None and cur.shape[1] > 0:
-                    self._collect_final(cur)
+            if tail is None or tail.shape[1] == 0:
+                continue
+            # FIX: capture P3 (stage2 output) even when the tail rows arrive
+            # via flush — previously the flush path never fired the j==2 branch
+            # for i==2, silently dropping tail P3 rows from p3_grid.
+            if i == 2:
+                self._collect_p3(tail.clone())
+            cur = tail
+            for j in range(i + 1, len(self.stream_stages)):
+                cur = self.stream_stages[j].push(cur)
+                if j == 2 and cur is not None and cur.shape[1] > 0:
+                    self._collect_p3(cur.clone())
+                if cur is None or cur.shape[1] == 0:
+                    cur = None
+                    break
+            if cur is not None and cur.shape[1] > 0:
+                self._collect_final(cur)
 
         # Flush last stage
         last_tail = self.stream_stages[-1].flush()

@@ -3,13 +3,9 @@
 import math
 import pathlib
 import numpy as np
-import torch
 
-from .config import DEFAULT_CONFIG
-from .fixedpoint import build_sig_lut, calibrate_fixed_point, magic_recip
-from .layers import ShiftConv2d
+from .fixedpoint import build_sig_lut, magic_recip
 from .model import NanoStreamOD
-from .quant import ZERO_EXP
 
 
 def _format_array_i8(arr, per_line=16, indent=4):
@@ -42,6 +38,40 @@ def _format_array_u16(arr, per_line=12, indent=4):
     return "\n".join(lines)
 
 
+def stage_buffer_sizes(cfg) -> list:
+    """Exact per-stage static buffer sizes (int16 elements) for the C kernel.
+
+    Derived from the true steady-state streaming bounds: each stage receives
+    ``strip_in`` rows per strip, emits at most ``ceil(strip_in/2)+1`` output
+    rows, needs a window of ``2*out_per_emit+3`` input rows (k=3, pad=1,
+    stride 2) and a ring of ``strip_in+4`` rows (2 kept overlap + margin).
+    Total static BSS for the default 160x160 model is ~224 KB — under the
+    256 KB budget, and provably overflow-free (the old flat 8192/16384
+    buffers overflowed on the first strip: stem cas alone needs 11520).
+    """
+    strip = cfg.strip_rows
+    stages = []
+    cin = cfg.in_channels
+    w_in = cfg.input_size
+    strip_in = strip
+    for i, cout in enumerate(cfg.stage_widths):
+        stride = 2
+        w_out = w_in // stride
+        out_per_emit = (strip_in + stride - 1) // stride + 1
+        win_rows = 2 * out_per_emit + 3
+        ring_rows = strip_in + 4
+        stages.append({
+            "ring": ring_rows * cin * w_in,
+            "win": win_rows * cin * w_in,
+            "cas": out_per_emit * cout * w_out,
+            "win_rows": win_rows,
+        })
+        strip_in = out_per_emit
+        cin = cout
+        w_in = w_out
+    return stages
+
+
 def export_c_header(model: NanoStreamOD, calib_fracs: dict, out_path: str | pathlib.Path):
     """Export frozen model weights to static C header file."""
     cfg = model.cfg
@@ -50,6 +80,14 @@ def export_c_header(model: NanoStreamOD, calib_fracs: dict, out_path: str | path
 
     sig_table = build_sig_lut()
     recip_m, recip_s = magic_recip(cfg.grid_size * cfg.grid_size, bits=24)
+    buffers = stage_buffer_sizes(cfg)
+    ring_defs = "\n".join(
+        f"#define NS_RING_ELEMS_{i}       {b['ring']}" for i, b in enumerate(buffers))
+    win_defs = "\n".join(
+        f"#define NS_WIN_ELEMS_{i}        {b['win']}" for i, b in enumerate(buffers))
+    cas_defs = "\n".join(
+        f"#define NS_CAS_ELEMS_{i}        {b['cas']}" for i, b in enumerate(buffers))
+    max_win_rows = max(b["win_rows"] for b in buffers)
 
     header_lines = [
         "/* ========================================================================= */",
@@ -74,13 +112,14 @@ def export_c_header(model: NanoStreamOD, calib_fracs: dict, out_path: str | path
         f"#define NS_INPUT_FRAC       {calib_fracs['input_frac']}",
         f"#define NS_RECIP_M          {recip_m}",
         f"#define NS_RECIP_S          {recip_s}",
-        f"#define NS_BOX_SCALE_NUM    5",
-        f"#define NS_BOX_SCALE_DEN    2",
+        "#define NS_BOX_SCALE_NUM    5",
+        "#define NS_BOX_SCALE_DEN    2",
         "",
-        "/* Buffer sizing constants */",
-        "#define NS_RING_ELEMS       16384",
-        "#define NS_WIN_ELEMS        8192",
-        "#define NS_CAS_ELEMS        8192",
+        "/* Buffer sizing constants (exact per-stage, see stage_buffer_sizes) */",
+        f"#define NS_MAX_WIN_ROWS        {max_win_rows}",
+        ring_defs,
+        win_defs,
+        cas_defs,
         "",
         "typedef struct {",
         "    const char *name;",
@@ -191,7 +230,11 @@ def export_c_header(model: NanoStreamOD, calib_fracs: dict, out_path: str | path
         }
 
     head1_conv = head_module.conv1
-    head_out_frac = calib_fracs["head_in_frac"].get("head1", 12) - head1_conv.fixed_out_shift
+    head1_in_frac = calib_fracs["head_in_frac"].get("head1", 12)
+    head1_out_frac = head1_in_frac - head1_conv.fixed_out_shift
+    # FIX: NS_HEAD_OUT_FRAC must be the output fraction of the branch convs
+    # actually decoded (obj/box/cls), not just head1's output.
+    head_out_frac = head1_out_frac - head_module.obj.fixed_out_shift
     # BUG-12 FIX: Find correct insertion point dynamically instead of hardcoded index
     head_frac_line = f"#define NS_HEAD_OUT_FRAC    {head_out_frac}"
     insert_idx = len(header_lines)

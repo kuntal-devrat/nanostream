@@ -49,28 +49,37 @@ def evaluate_recall(model, n=64, seed=999, conf=0.3, iou_thr=0.5):
 
 def train(args):
     torch.manual_seed(args.seed)
-    model = NanoStreamOD()
+    np.random.seed(args.seed)  # FIX: seed numpy too (SyntheticShapes uses it)
+    device = torch.device(args.device if args.device else
+                          ("cuda" if torch.cuda.is_available() else "cpu"))
+    model = NanoStreamOD().to(device)
     out_dir = pathlib.Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     ds = SyntheticShapes(length=args.steps * args.batch, seed=args.seed + 1)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr,
                             weight_decay=5e-4)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(
-        opt, T_max=args.steps)
+    warmup_steps = min(50, args.steps // 10)
+
+    # FIX: use the same LambdaLR warmup+cosine as train_faces. The old manual
+    # pg['lr'] = ... assignment was immediately overwritten by CosineAnnealingLR's
+    # step(), so the warmup ramp never actually happened.
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return float(step + 1) / float(max(1, warmup_steps))
+        progress = float(step - warmup_steps) / float(max(1, args.steps - warmup_steps))
+        return max(0.01, 0.5 * (1.0 + np.cos(np.pi * progress)))
+
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
     model.train()
     running = []
     rng = np.random.default_rng(args.seed + 42)
-    warmup_steps = min(50, args.steps // 10)
     for step in range(args.steps):
         # BUG-11 FIX: Random sampling instead of always using indices 0..batch-1
         indices = rng.integers(0, len(ds), size=args.batch)
         xs, ts = collate([ds[int(i)] for i in indices])
-        # LR warmup (GAP-5 fix)
-        if step < warmup_steps:
-            warmup_factor = (step + 1) / warmup_steps
-            for pg in opt.param_groups:
-                pg['lr'] = args.lr * warmup_factor
+        xs = xs.to(device)
+        ts = [{k: v.to(device) for k, v in t.items()} for t in ts]
         preds = model(xs)
         losses = detection_loss(preds, ts, model.cfg)
         opt.zero_grad()
@@ -87,7 +96,7 @@ def train(args):
                   f"l1 {float(losses.get('l1', 0)):.4f} "
                   f"cls {float(losses['cls']):.4f} "
                   f"pos {losses['num_pos']:.0f}")
-    recall, hits, total = evaluate_recall(model)
+    recall, hits, total = evaluate_recall(model, n=64, seed=999, conf=0.3)
     print(f"val recall@{args.steps}: {recall:.2%} ({hits}/{total})")
     ckpt = {"model": model.state_dict(), "config": vars(model.cfg)}
     torch.save(ckpt, out_dir / "nanostream_shapes.pt")
@@ -102,7 +111,7 @@ def main():
     p.add_argument("--lr", type=float, default=2e-3)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out", type=str, default="runs/shapes")
-    p.add_argument("--classes", action="store_true")
+    p.add_argument("--device", type=str, default="", help="torch device (cuda/cpu)")
     args = p.parse_args()
     train(args)
 

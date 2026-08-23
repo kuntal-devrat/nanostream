@@ -5,6 +5,7 @@ and per-layer output-shift calibration."""
 import math
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 LUT_BITS = 7
 LUT_SIZE = 1 << (16 - LUT_BITS)
@@ -116,59 +117,82 @@ def calibrate_fixed_point(model, images_u8, frac_bits: int = 12,
         else:
             head_fracs[cname] = hf
 
+    # P3 grid (stage2 output) input fraction for neck + P3 head parity.
+    # stage2 is backbone.stages[1]; its output fraction = input - conv shift.
+    p3_frac = frac_bits
+    for i, blk in enumerate(model.backbone.stages):
+        p3_frac -= blk.conv.fixed_out_shift
+        if i == 1:  # stage2 output is the P3 feature map
+            break
+
     return {"input_frac": frac_bits, "stage_in_frac": fracs,
-            "head_in_frac": head_fracs}
+            "head_in_frac": head_fracs, "p3_in_frac": p3_frac}
 
 
 @torch.no_grad()
 def decode_int_detections(obj_q: torch.Tensor, box_q: torch.Tensor,
                           cls_q: torch.Tensor, out_frac: int,
-                          G: int, conf_thr: float = 0.30):
-    """Integer decoding for microcontroller: table lookups and integer math."""
-    q15_scale = 15 - out_frac
-    if q15_scale >= 0:
-        obj_q15 = (obj_q.to(torch.int64) << q15_scale).clamp(-32768, 32767).to(torch.int32)
-    else:
-        obj_q15 = (obj_q.to(torch.int64) >> (-q15_scale)).clamp(-32768, 32767).to(torch.int32)
+                          G: int, conf_thr: float = 0.30, max_det: int = 16):
+    """Integer decoding mirroring the C ns_decode, cell-for-cell:
 
-    prob_q15 = sig_lut_q(obj_q15)
+      - 3x3 local-peak suppression on the objectness grid (no NMS module)
+      - sigmoid via the shared Q15 LUT
+      - 2.5x box scale (NS_BOX_SCALE_NUM/DEN) clamped to [0, 1]
+      - class-weighted score: prob * (16384 + cls_conf>>1) >> 15
+
+    Matches nanostream/mcu/nanostream_mcu.c ns_decode() bit-for-bit.
+    """
+    q15_scale = 15 - out_frac
+
+    def _to_q15(t):
+        if q15_scale >= 0:
+            return (t.to(torch.int64) << q15_scale).clamp(-32768, 32767).to(torch.int32)
+        return (t.to(torch.int64) >> (-q15_scale)).clamp(-32768, 32767).to(torch.int32)
+
+    obj_q15 = _to_q15(obj_q)          # (G, G) Q15
+    prob_q15 = sig_lut_q(obj_q15)     # (G, G) Q15 probability
     thr_q15 = int(round(conf_thr * 32767.0))
-    mask = prob_q15 > thr_q15
+
+    # 3x3 local peak suppression (mirror C: keep cells with no higher neighbor)
+    prob_f = prob_q15.float()
+    obj_max = F.max_pool2d(prob_f.unsqueeze(0).unsqueeze(0),
+                           kernel_size=3, stride=1, padding=1)[0, 0]
+    # FIX: compare Q15 ints (mirror C's `prob > conf_thr_q15`), not float-vs-int
+    mask = (prob_f == obj_max) & (prob_q15 > thr_q15)
     ys, xs = mask.nonzero(as_tuple=True)
     if ys.numel() == 0:
         return torch.zeros(0, 6, dtype=torch.float32)
 
-    scores = prob_q15[ys, xs].float() / 32767.0
-
-    bx_q = box_q[:, ys, xs]
-    if q15_scale >= 0:
-        bx_q15 = (bx_q.to(torch.int64) << q15_scale).clamp(-32768, 32767).to(torch.int32)
-    else:
-        bx_q15 = (bx_q.to(torch.int64) >> (-q15_scale)).clamp(-32768, 32767).to(torch.int32)
-
-    cx_sig = sig_lut_q(bx_q15[0]).float() / 32767.0
+    bx_q15 = _to_q15(box_q)           # (4, G, G)
+    cx_sig = sig_lut_q(bx_q15[0]).float() / 32767.0   # sigmoid in [0, 1]
     cy_sig = sig_lut_q(bx_q15[1]).float() / 32767.0
     w_sig = sig_lut_q(bx_q15[2]).float() / 32767.0
     h_sig = sig_lut_q(bx_q15[3]).float() / 32767.0
 
-    cx = (xs.float() + cx_sig) / G
-    cy = (ys.float() + cy_sig) / G
-    bw = w_sig
-    bh = h_sig
+    # 2.5x box scale with Q12 cap 4096 -> clamp to 1.0 (C: (sw>>3)*5/2)
+    bw = (2.5 * w_sig).clamp(max=1.0)
+    bh = (2.5 * h_sig).clamp(max=1.0)
 
-    # BUG-8 FIX: Integer argmax on cls_q instead of hardcoding class 0
-    cls_vals = cls_q[:, ys, xs]  # (num_classes, N)
-    if cls_vals.shape[0] > 1:
-        cls_ids = cls_vals.argmax(dim=0).float()
-    else:
-        cls_ids = torch.zeros(ys.shape[0], dtype=torch.float32)
+    cx = (xs.float() + cx_sig[ys, xs]) / G
+    cy = (ys.float() + cy_sig[ys, xs]) / G
+
+    # Integer argmax on cls_q (no hardcoded class 0)
+    cls_vals = cls_q[:, ys, xs]       # (num_classes, N)
+    cls_ids = cls_vals.argmax(dim=0).float()
+
+    # Class-weighted score: prob * (16384 + cls_conf>>1) >> 15, Q15 out
+    cls_conf_q15 = sig_lut_q(_to_q15(cls_vals.max(dim=0).values))
+    final_q15 = (prob_q15[ys, xs].to(torch.int64) *
+                 (16384 + (cls_conf_q15 >> 1))) >> 15
+    scores = final_q15.float() / 32767.0
 
     dets = torch.stack([
-        (cx - bw / 2).clamp(0.0, 1.0),
-        (cy - bh / 2).clamp(0.0, 1.0),
-        (cx + bw / 2).clamp(0.0, 1.0),
-        (cy + bh / 2).clamp(0.0, 1.0),
+        (cx - bw[ys, xs] / 2).clamp(0.0, 1.0),
+        (cy - bh[ys, xs] / 2).clamp(0.0, 1.0),
+        (cx + bw[ys, xs] / 2).clamp(0.0, 1.0),
+        (cy + bh[ys, xs] / 2).clamp(0.0, 1.0),
         scores,
         cls_ids,
     ], dim=1)
-    return dets
+    order = torch.argsort(dets[:, 4], descending=True)[:max_det]
+    return dets[order]

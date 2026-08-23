@@ -6,7 +6,8 @@
 #include <stdint.h>
 
 #define NS_TAP_OFF (-128)
-#define NS_MAX_WIN_ROWS 24
+/* NS_MAX_WIN_ROWS and all buffer sizing defines are generated into
+   model_weights.h by export.stage_buffer_sizes() — do not hardcode here. */
 #define NS_MAX_DET 24
 
 typedef struct {

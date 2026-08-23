@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from . import tracker
-from .quant import Pow2Weight, pow2_quantize
+from .quant import Pow2Weight, ZERO_EXP, pow2_quantize
 
 
 def _ishift(t: torch.Tensor, e: int) -> torch.Tensor:
@@ -100,7 +100,7 @@ class ShiftConv2d(nn.Module):
                         eo = E[oc, :, ky, kx]
                         so = S[oc, :, ky, kx]
                         for ev in torch.unique(eo).tolist():
-                            if ev <= -99:
+                            if ev <= ZERO_EXP:
                                 continue
                             sel = eo == ev
                             signed = _ishift(patch[:, sel], int(ev)) * \
@@ -121,7 +121,7 @@ class ShiftConv2d(nn.Module):
                             eo = E[oc, :, ky, kx]
                             so = S[oc, :, ky, kx]
                             for ev in torch.unique(eo).tolist():
-                                if ev <= -99:
+                                if ev <= ZERO_EXP:
                                     continue
                                 sel = eo == ev
                                 signed = _ishift(patch[:, sel], int(ev)) * \

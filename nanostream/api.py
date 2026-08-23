@@ -19,7 +19,7 @@ try:
 except ImportError:
     cv2 = None
 
-from .config import DEFAULT_CONFIG, NanoStreamConfig
+from .config import NanoStreamConfig
 from .data import CLASS_NAMES
 from .export import export_c_header as _export_c_header
 from .fixedpoint import calibrate_fixed_point
@@ -85,10 +85,10 @@ def load_model(checkpoint_path: Union[str, pathlib.Path] = None,
 
     if checkpoint_path is None or not pathlib.Path(checkpoint_path).exists():
         raise FileNotFoundError(
-            f"❌ Checkpoint file not found: '{checkpoint_path}'.\n"
-            f"You must train the model first before testing it!\n"
-            f"Run:\n"
-            f"    python -m nanostream.train_faces --steps 2000 --batch 16"
+            "Checkpoint file not found: '%s'.\n"
+            "You must train the model first before testing it!\n"
+            "Run:\n"
+            "    python -m nanostream.train_faces --steps 2000 --batch 16" % checkpoint_path
         )
 
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
@@ -103,10 +103,10 @@ def load_model(checkpoint_path: Union[str, pathlib.Path] = None,
     state_dict = ckpt["model"] if "model" in ckpt else ckpt
     try:
         model.load_state_dict(state_dict, strict=True)
-        print(f"✅ Successfully loaded trained checkpoint from: {checkpoint_path}")
-    except Exception as e:
+        print(f"Successfully loaded trained checkpoint from: {checkpoint_path}")
+    except Exception:
         model.load_state_dict(state_dict, strict=False)
-        print(f"⚠️ Loaded checkpoint with non-strict matching from: {checkpoint_path}")
+        print(f"Loaded checkpoint with non-strict matching from: {checkpoint_path}")
 
     if "classes" in ckpt:
         model.class_names = tuple(ckpt["classes"])

@@ -124,8 +124,10 @@ def train_faces(args):
         eval_ds = SyntheticFaces(length=200, size=160, seed=999)
         data_source = "synthetic_procedural"
     else:
-        train_ds = WebcamFaceDataset(data_dir, augment=True, cache_in_ram=True)
-        eval_ds = WebcamFaceDataset(data_dir, augment=False, cache_in_ram=True)
+        train_ds = WebcamFaceDataset(data_dir, augment=True, cache_in_ram=True,
+                                     split="train", val_frac=0.2, seed=args.seed)
+        eval_ds = WebcamFaceDataset(data_dir, augment=False, cache_in_ram=True,
+                                    split="val", val_frac=0.2, seed=args.seed)
         data_source = "webcam_real"
 
     out_dir = pathlib.Path(args.out)
@@ -199,7 +201,9 @@ def train_faces(args):
             print(f"  >>> Eval @ step {step+1}: "
                   f"mAP@50={map50:.1%} mAP@50:95={map50_95:.1%} "
                   f"Recall={recall:.1%} Prec={prec:.1%} ({h}/{t})")
-            if map50 > best_map or recall > 0.80:
+            # FIX: only overwrite the best checkpoint on a strictly better mAP
+            # (the old `or recall > 0.80` let a worse-mAP ckpt clobber a better one)
+            if map50 > best_map:
                 best_map = map50
                 ckpt = {
                     "model": model.state_dict(),
@@ -246,7 +250,7 @@ def train_faces(args):
     if best_path.exists():
         import shutil
         shutil.copy2(best_path, ckpt_path)
-        print(f"Restored best checkpoint")
+        print("Restored best checkpoint")
 
     return model
 

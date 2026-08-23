@@ -190,11 +190,13 @@ def make_face_sample(size=160, max_faces=2, rng=None):
             cx = int(rng.integers(min_cx, max_cx))
             cy = int(rng.integers(min_cy, max_cy))
 
-            # Non-overlap check
-            ok = True
+            # Non-overlap check — FIX: _draw_face returns bbox cx±1.05rx, so the
+            # candidate must use the same 1.05 margin or adjacent faces can pass
+            # the check yet still overlap in the drawn region.
+            m = 1.05
             for (bx1, by1, bx2, by2) in boxes:
-                cand_x1, cand_y1 = cx - rx, cy - ry
-                cand_x2, cand_y2 = cx + rx, cy + ry
+                cand_x1, cand_y1 = cx - int(rx * m), cy - int(ry * m)
+                cand_x2, cand_y2 = cx + int(rx * m), cy + int(ry * m)
                 ix = max(0, min(cand_x2, bx2) - max(cand_x1, bx1))
                 iy = max(0, min(cand_y2, by2) - max(cand_y1, by1))
                 inter = ix * iy

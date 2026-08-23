@@ -240,7 +240,7 @@ def download_online_face_dataset(
             if saved % 10 == 0 or idx == len(CURATED_FACE_PHOTO_IDS) - 1:
                 print(f"  Downloaded & labeled: {saved} online face portraits ({time.perf_counter() - t0:.1f}s)")
 
-        except Exception as e:
+        except Exception:
             continue
 
     with open(ann_path, "w") as f:
@@ -285,10 +285,10 @@ def capture_webcam_training_data(
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
-    print(f"\n{'='*60}")
-    print(f"  Webcam Face Data Capture")
+    print("\n" + "=" * 60)
+    print("  Webcam Face Data Capture")
     print(f"  Capturing {n_frames} frames from camera {camera_id}")
-    print(f"  Move your face around: angles, distances, lighting.")
+    print("  Move your face around: angles, distances, lighting.")
     print(f"{'='*60}\n")
 
     captured = 0
@@ -366,7 +366,8 @@ class RealFaceDataset(torch.utils.data.Dataset):
     """PyTorch Dataset with robust multi-condition photorealistic augmentations."""
 
     def __init__(self, data_dir: Union[str, pathlib.Path] = DATA_DIR, img_size: int = 160,
-                 augment: bool = True, cache_in_ram: bool = False):
+                 augment: bool = True, cache_in_ram: bool = False,
+                 split: str = "train", val_frac: float = 0.2, seed: int = 42):
         self.data_dir = pathlib.Path(data_dir)
         self.img_size = img_size
         self.img_dir = self.data_dir / "images"
@@ -378,22 +379,36 @@ class RealFaceDataset(torch.utils.data.Dataset):
                 self.img_dir = pathlib.Path("data/webcam_faces/images")
             else:
                 raise FileNotFoundError(
-                    f"No face dataset found. Run:\n"
-                    f"  python -m nanostream.dataset --download-online"
+                    "No face dataset found. Run:\n"
+                    "  python -m nanostream.dataset --download-online"
                 )
 
         with open(ann_path) as f:
             self.annotations = json.load(f)
+
+        # FIX: real train/val split. Previously eval_ds was built over the SAME
+        # annotations as train_ds (only augment differed), so every validation
+        # sample was a training sample and mAP/recall were inflated.
+        n = len(self.annotations)
+        idx_all = np.arange(n)
+        rng_split = np.random.default_rng(seed)
+        rng_split.shuffle(idx_all)
+        n_val = max(1, int(round(n * val_frac)))
+        if split in ("val", "eval"):
+            self._indices = idx_all[n - n_val:]
+        else:
+            self._indices = idx_all[:n - n_val]
+
         self.augment = augment
         self.cache_in_ram = cache_in_ram
         self.cache = {}
-        self.rng = np.random.default_rng(42)
+        self.rng = np.random.default_rng(seed)
 
     def __len__(self):
-        return len(self.annotations)
+        return len(self._indices)
 
     def __getitem__(self, idx):
-        ann = self.annotations[idx % len(self.annotations)]
+        ann = self.annotations[self._indices[idx % len(self._indices)]]
         file_key = ann["file"]
         if self.cache_in_ram and file_key in self.cache:
             img = self.cache[file_key].copy()

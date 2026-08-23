@@ -1,7 +1,6 @@
 """Test high-level NanoStream framework API."""
 
 import numpy as np
-import pytest
 import torch
 import nanostream as ns
 
@@ -15,10 +14,14 @@ def test_api_load_model_and_config():
 
 def test_api_detect_numpy_image():
     model = ns.load_model()
-    # Create synthetic test image
-    dummy_img = np.full((160, 160, 3), 128, dtype=np.uint8)
-    dets = ns.detect(model, dummy_img, conf_thr=0.05)
+    # FIX: use a KNOWN-POSITIVE input (bright square on dark background) so an
+    # empty result FAILS the test — previously a uniform-128 image with conf 0.05
+    # passed vacuously even if detect() always returned [].
+    dummy_img = np.full((160, 160, 3), 15, dtype=np.uint8)
+    dummy_img[55:105, 55:105] = 235
+    dets = ns.detect(model, dummy_img, conf_thr=0.10)
     assert isinstance(dets, list)
+    assert len(dets) > 0, "detect() returned no detections on a known-positive input"
     for d in dets:
         assert isinstance(d, ns.Detection)
         assert 0.0 <= d.score <= 1.0

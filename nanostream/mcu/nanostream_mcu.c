@@ -14,13 +14,39 @@
 #include "model_weights.h"
 
 typedef struct {
-    int16_t buf[NS_RING_ELEMS];
+    int16_t *buf;
+    int max_elems;  /* capacity in int16 elements (per-stage, exporter-sized) */
     int abs_base;   /* absolute input-row index of buf[0] */
     int count;      /* rows stored */
     int next_out;   /* absolute output row to produce next */
 } ns_ring_t;
 
 static ns_ring_t g_stage[NS_STAGES];
+
+/* Per-stage ring buffers. Sizes are computed exactly by export.stage_buffer_sizes()
+ * so the static footprint fits the 256 KB budget AND can never overflow — the old
+ * flat 16384-element rings + 8192-element win/cas buffers overflowed on the first
+ * strip (stem cas: 9*16*80 = 11520 > 8192). */
+static int16_t g_ring_buf0[NS_RING_ELEMS_0];
+static int16_t g_ring_buf1[NS_RING_ELEMS_1];
+static int16_t g_ring_buf2[NS_RING_ELEMS_2];
+static int16_t g_ring_buf3[NS_RING_ELEMS_3];
+static int16_t *g_ring_buf[NS_STAGES] = {g_ring_buf0, g_ring_buf1, g_ring_buf2, g_ring_buf3};
+static const int g_ring_elems[NS_STAGES] = {NS_RING_ELEMS_0, NS_RING_ELEMS_1, NS_RING_ELEMS_2, NS_RING_ELEMS_3};
+
+static int16_t g_win0[NS_WIN_ELEMS_0];
+static int16_t g_win1[NS_WIN_ELEMS_1];
+static int16_t g_win2[NS_WIN_ELEMS_2];
+static int16_t g_win3[NS_WIN_ELEMS_3];
+static int16_t *g_win[NS_STAGES] = {g_win0, g_win1, g_win2, g_win3};
+static const int g_win_elems[NS_STAGES] = {NS_WIN_ELEMS_0, NS_WIN_ELEMS_1, NS_WIN_ELEMS_2, NS_WIN_ELEMS_3};
+
+static int16_t g_cas0[NS_CAS_ELEMS_0];
+static int16_t g_cas1[NS_CAS_ELEMS_1];
+static int16_t g_cas2[NS_CAS_ELEMS_2];
+static int16_t g_cas3[NS_CAS_ELEMS_3];
+static int16_t *g_cas[NS_STAGES] = {g_cas0, g_cas1, g_cas2, g_cas3};
+static const int g_cas_elems[NS_STAGES] = {NS_CAS_ELEMS_0, NS_CAS_ELEMS_1, NS_CAS_ELEMS_2, NS_CAS_ELEMS_3};
 
 static int16_t g_grid[NS_CG][NS_GRID * NS_GRID];
 static int32_t g_ctx_sum[NS_CG];
@@ -33,8 +59,6 @@ static int16_t g_obj[1][NS_GRID * NS_GRID];
 static int16_t g_box[4][NS_GRID * NS_GRID];
 static int16_t g_cls[NS_NUM_CLASSES][NS_GRID * NS_GRID];
 
-static int16_t g_win[NS_STAGES][NS_WIN_ELEMS];
-static int16_t g_cas[NS_STAGES][NS_CAS_ELEMS];
 static int16_t g_input_strip[NS_STRIP_ROWS * NS_INPUT_SIZE];
 
 static inline int16_t ns_sig_q15(int32_t x) {
@@ -138,13 +162,29 @@ static void stage_emit_ready(int si) {
         if (r->next_out >= L->total_out || r->count == 0) {
             return;
         }
-        int s = 1 << L->stride_sh, p = L->pad;
+        int s = 1 << L->stride_sh, p = L->pad, k = L->k;
         int last = r->abs_base + r->count - 1;
         int j_max = (last - p) >> L->stride_sh;
         if (j_max < r->next_out) return;
         if (j_max >= L->total_out) j_max = L->total_out - 1;
 
         int j_lo = r->next_out;
+
+        /* FIX: clamp the emit span so the static window/output staging buffers
+         * can never overflow (defense-in-depth; sizes are exact per-stage). */
+        {
+            int row_elems = L->cin * L->w_in;
+            int out_row_elems = L->cout * L->w_out;
+            int win_rows_cap = g_win_elems[si] / row_elems;       /* max Hw */
+            int cas_rows_cap = g_cas_elems[si] / out_row_elems;   /* max n_out */
+            int delta_cap = (win_rows_cap - 2 * p - 1) / s;       /* window bound */
+            /* n_out = delta + (4p - k + 1)/s + 1  <=  cas_rows_cap */
+            int cas_cap = cas_rows_cap - ((4 * p - k + 1) / s + 1);
+            if (cas_cap < delta_cap) delta_cap = cas_cap;
+            if (delta_cap < 0) delta_cap = 0;
+            if (j_max - j_lo > delta_cap) j_max = j_lo + delta_cap;
+        }
+
         int lo_raw = j_lo * s - p;
         int lo = ((lo_raw >> L->stride_sh) << L->stride_sh);
         int hi = j_max * s + p;
@@ -193,6 +233,8 @@ static void stage_feed(int si, const int16_t *rows, int n) {
     ns_ring_t *r = &g_stage[si];
     const ns_layer_t *L = &ns_layers[si];
     int row_elems = L->cin * L->w_in;
+    /* FIX: never write past the ring capacity (silent-corruption risk). */
+    if ((size_t)(r->count + n) * row_elems > (size_t)r->max_elems) return;
     memcpy(r->buf + (size_t)r->count * row_elems, rows,
            sizeof(int16_t) * (size_t)n * row_elems);
     r->count += n;
@@ -203,6 +245,10 @@ static void stage_feed(int si, const int16_t *rows, int n) {
 
 void ns_init(void) {
     memset(g_stage, 0, sizeof(g_stage));
+    for (int si = 0; si < NS_STAGES; si++) {
+        g_stage[si].buf = g_ring_buf[si];
+        g_stage[si].max_elems = g_ring_elems[si];
+    }
     memset(g_grid, 0, sizeof(g_grid));
     memset(g_ctx_sum, 0, sizeof(g_ctx_sum));
     g_grid_rows = 0;
@@ -233,7 +279,7 @@ void ns_finish_frame(void) {
             int last = r->abs_base + r->count - 1;
             if (need_hi > last) {
                 int missing = need_hi - last;
-                if ((size_t)(r->count + missing) * row_elems <= NS_RING_ELEMS) {
+                if ((size_t)(r->count + missing) * row_elems <= (size_t)r->max_elems) {
                     memset(r->buf + (size_t)r->count * row_elems, 0,
                            sizeof(int16_t) * (size_t)missing * row_elems);
                     r->count += missing;
@@ -264,13 +310,20 @@ void ns_finish_frame(void) {
     g_finished = 1;
 }
 
+static inline int32_t ns_q15_up(int32_t v, int up) {
+    /* FIX: negative/oversized shift is UB in C; guard both directions. */
+    if (up >= 0) return v << up;
+    return v >> (-up);
+}
+
 int ns_decode(ns_det_t *dets, int max_det, int conf_thr_q15) {
     if (!g_finished || dets == NULL || max_det <= 0) return 0;
     int up = 15 - NS_HEAD_OUT_FRAC;
+    if (up > 15) up = 15;   /* clamp: Q15 has 15 fraction bits */
     int count = 0;
 
     for (int cell = 0; cell < NS_GRID * NS_GRID; cell++) {
-        int32_t obj_q15 = (int32_t)g_obj[0][cell] << up;
+        int32_t obj_q15 = ns_q15_up((int32_t)g_obj[0][cell], up);
         int16_t prob = ns_sig_q15(obj_q15);
         if (prob > conf_thr_q15) {
             int row = cell / NS_GRID;
@@ -286,7 +339,7 @@ int ns_decode(ns_det_t *dets, int max_det, int conf_thr_q15) {
                     int nc = col + dc;
                     if (nc < 0 || nc >= NS_GRID) continue;
                     int n_cell = nr * NS_GRID + nc;
-                    int32_t n_obj_q15 = (int32_t)g_obj[0][n_cell] << up;
+                    int32_t n_obj_q15 = ns_q15_up((int32_t)g_obj[0][n_cell], up);
                     int16_t n_prob = ns_sig_q15(n_obj_q15);
                     if (n_prob > prob) {
                         is_local_max = 0;
@@ -297,10 +350,10 @@ int ns_decode(ns_det_t *dets, int max_det, int conf_thr_q15) {
             }
             if (!is_local_max) continue;
 
-            int16_t sx = ns_sig_q15((int32_t)g_box[0][cell] << up);
-            int16_t sy = ns_sig_q15((int32_t)g_box[1][cell] << up);
-            int16_t sw = ns_sig_q15((int32_t)g_box[2][cell] << up);
-            int16_t sh = ns_sig_q15((int32_t)g_box[3][cell] << up);
+            int16_t sx = ns_sig_q15(ns_q15_up((int32_t)g_box[0][cell], up));
+            int16_t sy = ns_sig_q15(ns_q15_up((int32_t)g_box[1][cell], up));
+            int16_t sw = ns_sig_q15(ns_q15_up((int32_t)g_box[2][cell], up));
+            int16_t sh = ns_sig_q15(ns_q15_up((int32_t)g_box[3][cell], up));
 
             /* Q12 coordinates [0, 4096] with 2.5x box scale */
             int32_t cx = ((int32_t)(col << 12) + (sx >> 3)) / NS_GRID;
@@ -329,7 +382,7 @@ int ns_decode(ns_det_t *dets, int max_det, int conf_thr_q15) {
                 }
             }
 
-            int16_t cls_conf = ns_sig_q15((int32_t)max_cls_val << up);
+            int16_t cls_conf = ns_sig_q15(ns_q15_up((int32_t)max_cls_val, up));
             int32_t final_score = ((int32_t)prob * (16384 + (cls_conf >> 1))) >> 15;
 
             dets[count].x1 = (int16_t)x1;

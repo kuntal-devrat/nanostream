@@ -1,7 +1,7 @@
 # ⚡ NanoStream-OD: Ultra-Efficient, NMS-Free Patch-Streaming Object Detector
 
-[![Tests](https://img.shields.io/badge/Tests-15%2F15%20Passed-brightgreen.svg)](tests/)
-[![Peak SRAM](https://img.shields.io/badge/Peak%20SRAM-28.3%20KB-blue.svg)](#-memory-profile--budgets)
+[![Tests](https://img.shields.io/badge/Tests-37%2F37%20Passed-brightgreen.svg)](tests/)
+[![Peak SRAM](https://img.shields.io/badge/Static%20BSS-229.2%20KB-blue.svg)](#-memory-profile--budgets)
 [![Flash](https://img.shields.io/badge/Flash-30.0%20KB-purple.svg)](#-memory-profile--budgets)
 [![Zero-NMS](https://img.shields.io/badge/Zero--NMS-O(1)%20Direct-orange.svg)](#1-zero-nms-dual-assignment-head)
 [![Multiplier-Free](https://img.shields.io/badge/Ops-Bit--Shift%20Only-teal.svg)](#3-multiplier-free-bit-shift-operators)
@@ -26,8 +26,27 @@ All competitor specifications are sourced directly from published academic paper
 
 > **Key Architectural Highlights:**
 > 1. **Zero-NMS Direct Decode**: NanoStream-OD assigns unique spatial responsibilities during training, decoding detections directly via a single threshold test ($O(1)$) — completely eliminating the sorting loops and IoU matrix computations required by traditional detectors.
-> 2. **90.3% lower SRAM than MCUNet** (28.3 KB vs 292 KB).
+> 2. **Static BSS 229.2 KB** (measured from the exported C kernel's per-stage buffers) — fits the <256 KB MCU budget.
 > 3. **True Bounding Boxes**: Unlike FOMO which only predicts center centroids without box width/height, NanoStream-OD outputs full, accurate bounding boxes $(x_1, y_1, x_2, y_2)$.
+
+---
+
+## Cross-Framework Benchmark (shapes + faces)
+
+A reproducible head-to-head benchmark lives in `benchmarks/`: NanoStream-OD vs YOLOv8n (ultralytics) vs a FOMO-style detector (MobileNetV2-truncated + per-cell classification head, no anchors) on the same small synthetic dataset (4 classes: circle, square, triangle, face).
+
+```bash
+# 1. Export the dataset in YOLO format
+python -m benchmarks.run_compare data
+# 2. Train each model
+python -m benchmarks.train_nanostream --steps 800 --batch 16
+python -m benchmarks.train_fomo --steps 800 --batch 16
+python -m benchmarks.run_compare train-yolo --yolo_epochs 40
+# 3. Evaluate all on the same held-out split (same AP code)
+python -m benchmarks.run_compare eval
+```
+
+Results are written to `benchmarks/runs/results.json`; face-detection demo images land in `benchmarks/runs/face_demo/`.
 
 ---
 
@@ -138,7 +157,13 @@ nanostream/
 │       ├── nanostream_mcu.h  # Public MCU C API
 │       ├── nanostream_mcu.c  # Multiplier-free C inference runtime (zero malloc)
 │       └── mcu_test_runner.c # Standalone C host validation runner
-├── tests/                    # Pytest test suite (15/15 tests passing)
+├── benchmarks/               # Cross-framework benchmark (NanoStream vs YOLO vs FOMO)
+│   ├── combined_data.py      # Deterministic shapes+faces dataset (4 classes)
+│   ├── fomo_model.py         # FOMO-style MobileNetV2-truncated baseline
+│   ├── train_nanostream.py   # NanoStream training on the combined dataset
+│   ├── train_fomo.py         # FOMO baseline training
+│   └── run_compare.py        # Train/eval orchestrator (data, train-*, eval)
+├── tests/                    # Pytest test suite (37 tests passing)
 ├── demo_webcam.py            # Executable demo script
 ├── pyproject.toml            # Package configuration & CLI scripts
 └── README.md                 # Documentation

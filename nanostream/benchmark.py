@@ -17,6 +17,7 @@ import time
 import torch
 
 from .config import NanoStreamConfig
+from .export import stage_buffer_sizes
 from .model import NanoStreamOD
 from .tracker import ResourceTracker
 
@@ -93,13 +94,42 @@ BENCHMARK_DATA = [
 
 
 def measure_nanostream(runs: int = 200, size: int = 160):
-    """Measure NanoStream-OD specs live on this machine."""
+    """Measure NanoStream-OD specs live on this machine.
+
+    FIX: SRAM now reports the ACTUAL static C BSS (from export.stage_buffer_sizes),
+    not the simulated ring-buffer peak; flash uses int8 weights + int32 biases,
+    matching the generated model_weights.h layout.
+    """
     cfg = NanoStreamConfig(input_size=size, num_classes=1)
     model = NanoStreamOD(cfg)
     model.eval()
 
     params = model.param_count()
-    flash_kb = params * 2 / 1024  # int16 weights
+
+    # Static C BSS: rings + win/cas staging + grid/comb/h/obj/box/cls + input strip
+    buffers = stage_buffer_sizes(cfg)
+    bss = 0
+    for b in buffers:
+        bss += (b["ring"] + b["win"] + b["cas"]) * 2  # int16
+    G = cfg.grid_size
+    bss += (cfg.stage_widths[-1] * G * G           # g_grid
+            + (cfg.stage_widths[-1] + cfg.context_dim) * G * G  # g_comb
+            + cfg.head_hidden * G * G              # g_h
+            + (1 + 4 + cfg.num_classes) * G * G    # g_obj + g_box + g_cls
+            + cfg.strip_rows * cfg.input_size) * 2  # g_input_strip
+    peak_sram_kb = bss / 1024.0
+
+    # int8 exp+sgn weights + int32 biases -> realistic flash
+    flash_kb = (params * 2 + 4 * 0) / 1024.0  # placeholder, replaced below
+    # Count actual exported weight bytes: exp/sgn int8 per tap + int32 bias per out
+    tap_bytes = 0
+    bias_elems = 0
+    from .layers import ShiftConv2d
+    for m in model.modules():
+        if isinstance(m, ShiftConv2d):
+            tap_bytes += m.weight.numel() * 1  # int8 exp
+            bias_elems += m.out_channels
+    flash_kb = (tap_bytes * 2 + bias_elems * 4) / 1024.0  # exp + sgn + bias
 
     # Measure full forward FPS
     dummy = torch.randn(1, 1, size, size)
@@ -127,11 +157,10 @@ def measure_nanostream(runs: int = 200, size: int = 160):
     stream_fps = runs / (t1 - t0)
     stream_lat_ms = ((t1 - t0) / runs) * 1000.0
 
-    # Get SRAM from ResourceTracker
+    # MACs from the ResourceTracker (simulated shift-add conv)
     tr = ResourceTracker.get()
     summary = tr.summary()
-    peak_sram_kb = summary.get("peak_sram_kb_mcu", 28.3)
-    macs_m = summary.get("macs", 6_610_000) / 1e6
+    macs_m = summary.get("macs", 0) / 1e6
 
     return {
         "params_k": params / 1000,
@@ -176,15 +205,15 @@ def print_benchmark(local: dict):
 
     print("=" * 94)
 
-    print(f"\n[NanoStream-OD Local Measurements (This Machine)]:")
+    print("\n[NanoStream-OD Local Measurements (This Machine)]:")
     print(f"  Parameters     : {local['params_k']:.1f}k ({local['params_k']*1000:.0f} weights)")
-    print(f"  Flash (int16)  : {local['flash_kb']:.1f} KB")
-    print(f"  Peak SRAM      : {local['peak_sram_kb']:.1f} KB")
+    print(f"  Flash (int8)   : {local['flash_kb']:.1f} KB")
+    print(f"  Peak SRAM (static BSS) : {local['peak_sram_kb']:.1f} KB")
     print(f"  Full Forward   : {local['full_lat_ms']:.2f} ms ({local['full_fps']:.0f} FPS)")
     print(f"  Strip Streaming: {local['stream_lat_ms']:.2f} ms ({local['stream_fps']:.0f} FPS)")
-    print(f"  NMS Overhead   : Zero (O(1) direct threshold decode)")
+    print("  NMS Overhead   : Zero (O(1) direct threshold decode)")
 
-    print(f"\n[Sources]:")
+    print("\n[Sources]:")
     for r in BENCHMARK_DATA:
         if "Ours" not in r["model"]:
             print(f"  {r['model']}: {r['source']}")

@@ -1,11 +1,10 @@
 """Tests for NanoStream-OD core architecture and Zero-NMS head."""
 
-import pytest
 import torch
 
 from nanostream.config import NanoStreamConfig
 from nanostream.data import make_sample, to_target
-from nanostream.head import decode_cells, decode_detections, detection_loss
+from nanostream.head import decode_detections, detection_loss
 from nanostream.model import NanoStreamOD
 
 
@@ -48,20 +47,44 @@ def test_detection_loss_computes():
     assert "cls" in losses
     assert losses["total"].item() > 0.0
 
+    # FIX: gradients + optimizer step must work (backprop was untested before)
+    opt = torch.optim.SGD(model.parameters(), lr=1e-3)
+    losses["total"].backward()
+    grads = [p.grad for p in model.parameters() if p.grad is not None]
+    assert len(grads) > 0, "no gradients produced by detection_loss"
+    opt.step()
+
 
 def test_zero_nms_decode():
     cfg = NanoStreamConfig()
     model = NanoStreamOD(cfg)
     model.eval()
 
-    x = torch.randn(1, 1, 160, 160)
+    # FIX: use a known-positive input so an empty decode FAILS the test
+    x = torch.zeros(1, 1, 160, 160)
+    x[0, 0, 55:105, 55:105] = 1.0  # bright square
     with torch.no_grad():
         preds = model(x)
         dets = decode_detections(preds, conf_thr=0.01, max_det=10)
 
     # Tensor format: [x1, y1, x2, y2, score, cls_id]
-    if dets.numel() > 0:
-        assert dets.shape[1] == 6
-        assert (dets[:, :4] >= 0.0).all()
-        assert (dets[:, :4] <= 1.0).all()
-        assert (dets[:, 4] >= 0.0).all() and (dets[:, 4] <= 1.0).all()
+    assert dets.shape[1] == 6
+    assert dets.shape[0] > 0, "decode returned nothing on a known-positive input"
+    assert (dets[:, :4] >= 0.0).all()
+    assert (dets[:, :4] <= 1.0).all()
+    assert (dets[:, 4] >= 0.0).all() and (dets[:, 4] <= 1.0).all()
+
+
+def test_cross_scale_dedup_is_class_aware():
+    """Two overlapping detections of DIFFERENT classes must BOTH survive."""
+    from nanostream.head import _class_aware_dedup
+    dets = torch.tensor([
+        [0.2, 0.2, 0.6, 0.6, 0.90, 0.0],  # class 0, high score
+        [0.3, 0.3, 0.7, 0.7, 0.85, 1.0],  # class 1, overlaps class 0
+        [0.2, 0.2, 0.6, 0.6, 0.80, 0.0],  # class 0, identical box (IoU 1.0)
+    ])
+    kept = _class_aware_dedup(dets, iou_thr=0.5)
+    # class-0 dupe suppressed (IoU=1.0, same class); class-1 kept despite
+    # overlapping class 0 (different class)
+    assert kept.shape[0] == 2
+    assert set(kept[:, 5].tolist()) == {0.0, 1.0}

@@ -239,7 +239,8 @@ def photometric_distort(img, rng=None):
 
 
 def multi_scale_resize(img, boxes, target_size: int, rng=None,
-                       min_size: int = 128, max_size: int = 192):
+                       min_size: int = 128, max_size: int = 192,
+                       labels=None):
     """Multi-scale training: random resize then crop/pad to target.
 
     YOLO trains at random resolutions each batch for scale robustness.
@@ -289,25 +290,32 @@ def multi_scale_resize(img, boxes, target_size: int, rng=None,
                      for b in new_boxes]
         img_r = canvas
     elif rand_size > target_size:
-        # Random crop
-        off = int(rng.integers(0, rand_size - target_size + 1))
-        img_r = img_r[off:off+target_size, off:off+target_size]
-        new_boxes = [[b[0]-off, b[1]-off, b[2]-off, b[3]-off]
+        # Random 2D crop — FIX: the old code used ONE offset for both axes, so
+        # it only ever produced diagonal crops.
+        off_x = int(rng.integers(0, rand_size - target_size + 1))
+        off_y = int(rng.integers(0, rand_size - target_size + 1))
+        img_r = img_r[off_y:off_y+target_size, off_x:off_x+target_size]
+        new_boxes = [[b[0]-off_x, b[1]-off_y, b[2]-off_x, b[3]-off_y]
                      for b in new_boxes]
     # else: exact match, no change
 
-    # Clip and filter
+    # Clip and filter (labels follow boxes so counts never desync)
     final_boxes = []
-    for b in new_boxes:
+    final_labels = []
+    for i, b in enumerate(new_boxes):
         bx = [max(0, b[0]), max(0, b[1]),
               min(target_size, b[2]), min(target_size, b[3])]
         if (bx[2] - bx[0]) > 6 and (bx[3] - bx[1]) > 6:
             final_boxes.append(bx)
+            if labels is not None:
+                final_labels.append(labels[i])
 
+    if labels is not None:
+        return img_r, final_boxes, final_labels
     return img_r, final_boxes
 
 
-def geometric_augment(img, boxes, size, rng=None):
+def geometric_augment(img, boxes, size, rng=None, labels=None):
     """Combined geometric augmentations: flip, rotate, scale, translate.
 
     Args:
@@ -339,7 +347,8 @@ def geometric_augment(img, boxes, size, rng=None):
         img = cv2.warpAffine(img, M, (w, h),
                               borderValue=int(img.mean()))
         new_boxes = []
-        for bx1, by1, bx2, by2 in boxes:
+        new_labels = []
+        for i, (bx1, by1, bx2, by2) in enumerate(boxes):
             corners = np.array([
                 [bx1, by1, 1], [bx2, by1, 1],
                 [bx1, by2, 1], [bx2, by2, 1]
@@ -351,7 +360,11 @@ def geometric_augment(img, boxes, size, rng=None):
             ny2 = min(h, int(trans[1].max()))
             if (nx2 - nx1) > 6 and (ny2 - ny1) > 6:
                 new_boxes.append([nx1, ny1, nx2, ny2])
+                if labels is not None:
+                    new_labels.append(labels[i])
         boxes = new_boxes
+        if labels is not None:
+            labels = new_labels
 
     # 3. Random scale + translate
     if rng.random() > 0.4 and len(boxes) > 0:
@@ -365,7 +378,8 @@ def geometric_augment(img, boxes, size, rng=None):
         img = cv2.warpAffine(img, M, (w, h),
                               borderValue=int(img.mean()))
         new_boxes = []
-        for bx1, by1, bx2, by2 in boxes:
+        new_labels = []
+        for i, (bx1, by1, bx2, by2) in enumerate(boxes):
             pts = np.array([[bx1, by1, 1], [bx2, by2, 1]]).T
             trans = np.dot(M, pts)
             nx1 = max(0, int(min(trans[0])))
@@ -374,6 +388,12 @@ def geometric_augment(img, boxes, size, rng=None):
             ny2 = min(h, int(max(trans[1])))
             if (nx2 - nx1) > 6 and (ny2 - ny1) > 6:
                 new_boxes.append([nx1, ny1, nx2, ny2])
+                if labels is not None:
+                    new_labels.append(labels[i])
         boxes = new_boxes
+        if labels is not None:
+            labels = new_labels
 
+    if labels is not None:
+        return img, boxes, labels
     return img, boxes

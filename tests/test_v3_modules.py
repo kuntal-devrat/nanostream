@@ -1,12 +1,11 @@
 """Tests for NanoStream-OD v3.0 modules: losses, augmentations, metrics, and Lite-FPN."""
 
 import numpy as np
-import pytest
 import torch
 
 from nanostream.config import NanoStreamConfig
 from nanostream.losses import ciou_loss, varifocal_loss, scale_aware_assign
-from nanostream.augment import mosaic_4, mixup, cutout, photometric_distort, multi_scale_resize, geometric_augment
+from nanostream.augment import mosaic_4, mixup, cutout
 from nanostream.metrics import compute_ap_per_class, compute_map_multiscale, evaluate_model
 from nanostream.neck import LiteFPN
 from nanostream.model import NanoStreamOD
@@ -114,6 +113,28 @@ def test_metrics_ap_and_map():
     assert "mAP_50" in ms
     assert "mAP_50_95" in ms
     assert ms["mAP_50"] > 0.90
+
+
+def test_metrics_zero_class_not_inflated():
+    """A class with NO ground truth must contribute zero to precision/recall.
+
+    mAP follows COCO convention (averaged over classes present in the GT),
+    but aggregate precision/recall must average over ALL classes — the old
+    code dropped zero-precision classes, biasing them upward.
+    """
+    targets = [
+        {"boxes": [[0.1, 0.1, 0.3, 0.3]], "labels": [0]},
+    ]
+    # One perfect detection of class 0, NO predictions/GT for class 1
+    preds = [
+        {"boxes": [[0.1, 0.1, 0.3, 0.3]], "scores": [0.95], "class_ids": [0]},
+    ]
+    res = compute_ap_per_class(preds, targets, num_classes=2, iou_threshold=0.5)
+    # mAP over classes-with-GT = 1.0 (class 1 absent from GT, COCO-style)
+    assert res["mAP"] > 0.90
+    # precision/recall averaged over BOTH classes -> (1.0 + 0.0)/2 = 0.5
+    assert res["precision"] <= 0.51
+    assert res["recall"] <= 0.51
 
 
 def test_lite_fpn_neck():

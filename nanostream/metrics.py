@@ -6,7 +6,7 @@ for rigorous comparison against YOLO/FOMO/MCUNet benchmarks.
 
 import torch
 import numpy as np
-from typing import List, Dict, Tuple
+from typing import List, Dict
 
 
 def compute_iou_matrix(pred_boxes: np.ndarray,
@@ -177,11 +177,12 @@ def compute_ap_per_class(all_predictions: List[Dict],
     valid_aps = [ap for c, ap in per_class_ap.items() if class_n_gt[c] > 0]
     mAP = np.mean(valid_aps) if valid_aps else 0.0
 
-    # Overall precision/recall/F1
-    valid_precisions = [v for v in per_class_precision.values() if v > 0]
-    total_precision = float(np.mean(valid_precisions)) if len(valid_precisions) > 0 else 0.0
-    valid_recalls = [v for v in per_class_recall.values() if v > 0]
-    total_recall = float(np.mean(valid_recalls)) if len(valid_recalls) > 0 else 0.0
+    # Overall precision/recall/F1 — FIX: average over ALL classes including
+    # zeros. The old code dropped zero-precision classes, inflating aggregates.
+    per_class_precision_list = [per_class_precision[c] for c in range(num_classes)]
+    per_class_recall_list = [per_class_recall[c] for c in range(num_classes)]
+    total_precision = float(np.mean(per_class_precision_list)) if num_classes > 0 else 0.0
+    total_recall = float(np.mean(per_class_recall_list)) if num_classes > 0 else 0.0
     denom = total_precision + total_recall
     f1 = float(2 * total_precision * total_recall / denom) if denom > 1e-9 else 0.0
 

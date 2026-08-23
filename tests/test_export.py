@@ -2,7 +2,6 @@
 
 import pathlib
 import pytest
-import torch
 
 from nanostream.data import calibration_images
 from nanostream.export import export_c_header
@@ -42,14 +41,23 @@ def test_c_kernel_compilation_and_execution(tmp_path):
     if not gcc:
         pytest.skip("GCC not available on system")
 
-    # Paths
     mcu_dir = pathlib.Path(__file__).parent.parent / "nanostream" / "mcu"
     c_src = mcu_dir / "nanostream_mcu.c"
     runner_src = mcu_dir / "mcu_test_runner.c"
-    weights_h = mcu_dir / "model_weights.h"
 
-    if not weights_h.exists():
-        pytest.skip("model_weights.h not yet generated")
+    # FIX: compile the IN-TEST generated header (the old test used the
+    # pre-committed model_weights.h, so export and C-run were never coupled).
+    weights_h = tmp_path / "model_weights.h"
+    model = NanoStreamOD()
+    model.eval()
+    calib_imgs = calibration_images(n=4, size=160)
+    fracs = calibrate_fixed_point(model, calib_imgs, frac_bits=12, passes=1)
+    export_c_header(model, fracs, weights_h)
+
+    # The C source includes "model_weights.h" from its own directory; copy the
+    # generated header there so the compile uses it.
+    import shutil as _sh
+    _sh.copy2(weights_h, mcu_dir / "model_weights.h")
 
     bin_path = tmp_path / "mcu_test.exe"
     cmd_compile = [
@@ -63,4 +71,7 @@ def test_c_kernel_compilation_and_execution(tmp_path):
     res_run = subprocess.run(cmd_run, capture_output=True, text=True)
     assert res_run.returncode == 0, f"C execution failed: {res_run.stderr}"
     assert "Inference finished successfully!" in res_run.stdout
-    assert "Peak SRAM bounded within <256 KB" in res_run.stdout
+    # FIX: the runner now prints the ACTUAL static BSS (computed from the
+    # generated per-stage buffer sizes), not a hardcoded "<256 KB" string.
+    assert "Static BSS:" in res_run.stdout
+    assert "within 256 KB budget: YES" in res_run.stdout
