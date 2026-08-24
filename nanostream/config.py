@@ -94,3 +94,9 @@ class NanoStreamConfig:
 
 
 DEFAULT_CONFIG = NanoStreamConfig()
+
+PROFILES = {
+    "mcu": NanoStreamConfig.mcu,
+    "pro": NanoStreamConfig.pro,
+    "gpu": NanoStreamConfig.gpu,
+}

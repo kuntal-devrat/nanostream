@@ -29,6 +29,7 @@ train = ["opencv-python>=4.8"]
 dev = ["pytest>=7"]
 
 [project.scripts]
+nanostream = "nanostream.cli:main"
 nanostream-demo = "nanostream.demo:main"
 nanostream-train-faces = "nanostream.train_faces:main"
 nanostream-train-shapes = "nanostream.train_shapes:main"
