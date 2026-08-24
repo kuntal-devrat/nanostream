@@ -138,15 +138,26 @@ def magic_reciprocal(n: int, prec_bits: int = 20):
 
 
 def decode_cells(box_reg: torch.Tensor, G: int):
-    """Decode all G*G cells to absolute cxcywh boxes in [0,1] coords."""
-    device = box_reg.device
-    xs = torch.arange(G, device=device, dtype=torch.float32).view(1, G).expand(G, G)
-    ys = torch.arange(G, device=device, dtype=torch.float32).view(G, 1).expand(G, G)
-    cx = (xs + torch.sigmoid(box_reg[0])) / G
-    cy = (ys + torch.sigmoid(box_reg[1])) / G
-    w = (2.5 * torch.sigmoid(box_reg[2])).clamp(max=1.0)
-    h = (2.5 * torch.sigmoid(box_reg[3])).clamp(max=1.0)
-    return torch.stack([cx, cy, w, h], dim=-1).view(-1, 4)
+    """Decode all G*G cells to absolute cxcywh boxes in [0,1] coords.
+
+    Supports single-sample (4, G, G) -> (G*G, 4) and batched (B, 4, G, G) -> (B, G*G, 4).
+    """
+    is_batched = (box_reg.dim() == 4)
+    if not is_batched:
+        box_reg = box_reg.unsqueeze(0)
+
+    B = box_reg.shape[0]
+    dev = box_reg.device
+    xs = torch.arange(G, device=dev, dtype=torch.float32).view(1, 1, G).expand(B, G, G)
+    ys = torch.arange(G, device=dev, dtype=torch.float32).view(1, G, 1).expand(B, G, G)
+
+    cx = (xs + torch.sigmoid(box_reg[:, 0])) / G
+    cy = (ys + torch.sigmoid(box_reg[:, 1])) / G
+    w = (2.5 * torch.sigmoid(box_reg[:, 2])).clamp(max=1.0)
+    h = (2.5 * torch.sigmoid(box_reg[:, 3])).clamp(max=1.0)
+
+    res = torch.stack([cx, cy, w, h], dim=-1).view(B, -1, 4)
+    return res if is_batched else res[0]
 
 
 def cxcywh_to_xyxy(b):
@@ -154,6 +165,18 @@ def cxcywh_to_xyxy(b):
                         b[..., 1] - b[..., 3] / 2,
                         b[..., 0] + b[..., 2] / 2,
                         b[..., 1] + b[..., 3] / 2], dim=-1)
+
+
+def direct_iou(a: torch.Tensor, b: torch.Tensor):
+    """Direct 1-to-1 IoU between paired bounding boxes (N, 4) and (N, 4)."""
+    lt = torch.maximum(a[:, :2], b[:, :2])
+    rb = torch.minimum(a[:, 2:], b[:, 2:])
+    wh = (rb - lt).clamp(min=0)
+    inter = wh[:, 0] * wh[:, 1]
+    area_a = (a[:, 2] - a[:, 0]) * (a[:, 3] - a[:, 1])
+    area_b = (b[:, 2] - b[:, 0]) * (b[:, 3] - b[:, 1])
+    union = area_a + area_b - inter
+    return inter / union.clamp(min=1e-9)
 
 
 def pairwise_iou(a: torch.Tensor, b: torch.Tensor):
@@ -208,9 +231,6 @@ def assign_dual(box_reg: torch.Tensor, gt_boxes: torch.Tensor, G: int):
         row = int(min(max(0, math.floor(cy_grid)), G - 1))
         primary_cell = row * G + col
 
-        # FIX: crowded scenes used to silently DROP a GT when its primary cell
-        # was taken. Now we fall back to the nearest free cell so every GT gets
-        # at least one positive cell (never a zero-gradient box).
         if primary_cell in used:
             primary_cell = _nearest_free(row, col)
         if primary_cell is not None:
@@ -218,8 +238,7 @@ def assign_dual(box_reg: torch.Tensor, gt_boxes: torch.Tensor, G: int):
             prim_gt.append(gi)
             used.add(primary_cell)
 
-    # Secondaries: pick adjacent cells in the direction of the sub-cell offset;
-    # never steal a cell already used (primary of any GT, or secondary of another).
+    # Secondaries: pick adjacent cells in the direction of the sub-cell offset
     for gi in range(gt_boxes.shape[0]):
         gcx, gcy, gw, gh = gt_boxes[gi].tolist()
         if gw <= 0 or gh <= 0:
@@ -262,12 +281,7 @@ def assign_dual(box_reg: torch.Tensor, gt_boxes: torch.Tensor, G: int):
 def _iou_quality_targets(box_reg: torch.Tensor, assign: dict,
                          gt_boxes: torch.Tensor, G: int,
                          sec_scale: float = 0.5) -> torch.Tensor:
-    """VariFocal quality targets: predicted-IoU for positives, 0 elsewhere.
-
-    FIX: the old code used hard 0.5/1.0 labels, so the quality-aware half of
-    varifocal_loss was never exercised. Real VFL uses the IoU between the
-    decoded prediction and its assigned GT as the learning target.
-    """
+    """VariFocal quality targets: predicted-IoU for positives, 0 elsewhere."""
     tgt_obj = torch.zeros(G * G, device=box_reg.device)
     idx = torch.cat([assign["prim_idx"], assign["sec_idx"]])
     gsel = torch.cat([assign["prim_gt"], assign["sec_gt"]])
@@ -276,7 +290,7 @@ def _iou_quality_targets(box_reg: torch.Tensor, assign: dict,
     pred_all = decode_cells(box_reg, G)          # (G*G, 4) cxcywh
     p_xyxy = cxcywh_to_xyxy(pred_all[idx])
     t_xyxy = cxcywh_to_xyxy(gt_boxes[gsel])
-    ious = pairwise_iou(p_xyxy, t_xyxy).diag()  # per-assignment IoU
+    ious = direct_iou(p_xyxy, t_xyxy)            # O(N) direct 1-to-1 IoU
     n_prim = assign["prim_idx"].numel()
     is_sec = torch.arange(idx.numel(), device=idx.device) >= n_prim
     quality = torch.where(is_sec, ious * sec_scale, ious)

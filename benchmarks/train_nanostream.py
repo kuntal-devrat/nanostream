@@ -89,13 +89,19 @@ def _checkpoint_path(args):
     return pathlib.Path(out) / f"nanostream_{prof}.pt"
 
 
-def _save_ckpt(path, model, opt, sched, rng, step, cfg, profile):
+from nanostream.ema import ModelEMA
+
+
+def _save_ckpt(path, model, opt, sched, rng, step, cfg, profile, ema=None):
     """Save full training state so a later run can resume exactly."""
-    raw_model = getattr(model, "module", model)
+    # Use EMA shadow weights for highest evaluation accuracy if available
+    eval_model = ema.ema if ema is not None else getattr(model, "module", model)
     ckpt = {
-        "model": raw_model.state_dict(),
+        "model": eval_model.state_dict(),
+        "raw_model": getattr(model, "module", model).state_dict(),
         "optimizer": opt.state_dict(),
         "scheduler": sched.state_dict(),
+        "ema": ema.state_dict() if ema is not None else None,
         "rng_np": rng.bit_generator.state,
         "rng_torch": torch.get_rng_state(),
         "step": step,
@@ -105,25 +111,6 @@ def _save_ckpt(path, model, opt, sched, rng, step, cfg, profile):
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(ckpt, path)
-
-
-class BenchmarkDataset(torch.utils.data.Dataset):
-    """Parallelized fast dataset with in-RAM pre-rendered base samples."""
-    def __init__(self, cfg, data_len, total_samples, seed=42):
-        self.cfg = cfg
-        self.data_len = data_len
-        self.total_samples = total_samples
-        self.seed = seed
-        cache_count = min(data_len, 400)
-        self.sample_cache = [generate_sample(i, cfg.input_size) for i in range(cache_count)]
-
-    def __len__(self):
-        return self.total_samples
-
-    def __getitem__(self, idx):
-        rng = np.random.default_rng(self.seed + 1000 + idx)
-        img, boxes, labels = augment_sample(self.cfg, rng, len(self.sample_cache), sample_cache=self.sample_cache)
-        return _sample_to_tensor(img, boxes, labels, self.cfg.input_size)
 
 
 def train(args):
@@ -143,6 +130,18 @@ def train(args):
     if input_size:
         cfg.input_size = input_size
     model = NanoStreamOD(cfg).to(device)
+
+    # Initialize ModelEMA
+    ema = ModelEMA(model, decay=0.999)
+
+    # Optional torch.compile for modern GPU Triton kernel fusion
+    use_compile = getattr(args, "compile", False) and hasattr(torch, "compile") and device.type == "cuda"
+    if use_compile:
+        try:
+            model = torch.compile(model, mode="reduce-overhead")
+            print("[torch.compile] Model compilation active with Triton fusion!")
+        except Exception as e:
+            print(f"[torch.compile] Skipped compilation: {e}")
 
     # Multi-GPU DataParallel wrapping if multiple GPUs detected
     if device.type == "cuda" and torch.cuda.device_count() > 1:
@@ -168,7 +167,9 @@ def train(args):
     if resume and ckpt_path.exists():
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
         raw_m = getattr(model, "module", model)
-        raw_m.load_state_dict(ckpt["model"])
+        raw_m.load_state_dict(ckpt.get("raw_model", ckpt["model"]))
+        if ckpt.get("ema") is not None:
+            ema.load_state_dict(ckpt["ema"])
         opt.load_state_dict(ckpt["optimizer"])
         sched.load_state_dict(ckpt["scheduler"])
         rng.bit_generator.state = ckpt["rng_np"]
@@ -229,6 +230,7 @@ def train(args):
         torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
         scaler.step(opt)
         scaler.update()
+        ema.update(model, step)
         sched.step()
 
         if step % 100 == 0 or step == steps - 1:
@@ -240,10 +242,10 @@ def train(args):
                   f"obj {obj_l:.3f} box {box_l:.3f} "
                   f"cls {cls_l:.3f} pos {losses['num_pos']:.0f}")
         if save_every and step % save_every == 0 and step > start_step:
-            _save_ckpt(ckpt_path, model, opt, sched, rng, step, cfg, profile)
+            _save_ckpt(ckpt_path, model, opt, sched, rng, step, cfg, profile, ema=ema)
             print(f"[ckpt] {profile} step {step} -> {ckpt_path}")
 
-    _save_ckpt(ckpt_path, model, opt, sched, rng, steps - 1, cfg, profile)
+    _save_ckpt(ckpt_path, model, opt, sched, rng, steps - 1, cfg, profile, ema=ema)
     print(f"saved -> {ckpt_path}")
     return model
 
@@ -259,6 +261,8 @@ def main():
     p.add_argument("--data_len", type=int, default=1200)
     p.add_argument("--out", type=str, default="benchmarks/runs/ckpt")
     p.add_argument("--device", type=str, default="")
+    p.add_argument("--compile", action="store_true",
+                   help="enable torch.compile Triton kernel fusion")
     p.add_argument("--save_every", type=int, default=500,
                    help="checkpoint every N steps (for resume)")
     p.add_argument("--resume", action="store_true",

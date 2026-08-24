@@ -324,6 +324,7 @@ def main():
     ns.add_argument("--resume", action="store_true")
     ns.add_argument("--out", type=str, default=str(CKPT_DIR))
     ns.add_argument("--device", type=str, default="", help="torch device (cuda/cpu)")
+    ns.add_argument("--compile", action="store_true", help="Enable torch.compile Triton kernel fusion")
     fs = sub.add_parser("train-fomo")
     fs.add_argument("--steps", type=int, default=1000)
     fs.add_argument("--batch", type=int, default=16)
