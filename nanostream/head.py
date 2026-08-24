@@ -107,7 +107,6 @@ class DualAssignHead(nn.Module):
             "obj": out_p4["obj"],
             "box": out_p4["box"],
             "cls": out_p4["cls"],
-            "G": G,
         }
 
         if self.dual_scale and self.head_p3 is not None and feat_p3 is not None:
@@ -115,7 +114,6 @@ class DualAssignHead(nn.Module):
             result["p3_obj"] = out_p3["obj"]
             result["p3_box"] = out_p3["box"]
             result["p3_cls"] = out_p3["cls"]
-            result["G_p3"] = feat_p3.shape[-1]
 
         return result
 
@@ -363,7 +361,7 @@ def detection_loss(preds: dict, targets: list, cfg=None, device=None,
         p3_obj_preds = preds["p3_obj"]
         p3_box_preds = preds["p3_box"]
         p3_cls_preds = preds.get("p3_cls", None)
-        G_p3 = preds["G_p3"]
+        G_p3 = preds.get("G_p3", p3_obj_preds.shape[-1])
         loss_p3_obj = torch.tensor(0.0, device=dev)
         loss_p3_box = torch.tensor(0.0, device=dev)
         loss_p3_l1 = torch.tensor(0.0, device=dev)
