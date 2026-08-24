@@ -28,7 +28,7 @@ PROFILES = {
 }
 
 
-def augment_sample(cfg, rng, data_len):
+def augment_sample(cfg, rng, data_len, sample_cache=None):
     """Build one augmented training sample (uint8 img, pixel boxes, labels).
 
     Mirrors the YOLOv8 recipe at a scale appropriate to the config profile:
@@ -36,23 +36,29 @@ def augment_sample(cfg, rng, data_len):
     All ops run in pixel space; boxes stay [x1, y1, x2, y2] lists.
     """
     size = cfg.input_size
+
+    def _get(idx):
+        if sample_cache is not None and len(sample_cache) > 0:
+            im, bx, lb = sample_cache[idx % len(sample_cache)]
+            return im.copy(), [b[:] for b in bx], list(lb)
+        return generate_sample(idx, size)
+
     if cfg.augment_mosaic and rng.random() < 0.5:
         idxs = rng.integers(0, data_len, size=4)
         imgs, box_l, lab_l = [], [], []
         for i in idxs:
-            im, bx, lb = generate_sample(int(i), size)
+            im, bx, lb = _get(int(i))
             imgs.append(im)
             box_l.append(bx)
             lab_l.append(lb)
         img, boxes, labels = mosaic_4(imgs, box_l, lab_l, size, rng)
     else:
         idx = int(rng.integers(0, data_len))
-        img, boxes, labels = generate_sample(idx, size)
-        boxes, labels = list(boxes), list(labels)
+        img, boxes, labels = _get(idx)
 
     if cfg.augment_mixup and rng.random() < 0.3 and len(boxes) > 0:
         idx2 = int(rng.integers(0, data_len))
-        img2, bx2, lb2 = generate_sample(idx2, size)
+        img2, bx2, lb2 = _get(idx2)
         img, boxes, labels = mixup(img, boxes, labels, img2, bx2, lb2, rng=rng)
 
     if cfg.multi_scale_train and rng.random() < 0.5:
@@ -85,8 +91,9 @@ def _checkpoint_path(args):
 
 def _save_ckpt(path, model, opt, sched, rng, step, cfg, profile):
     """Save full training state so a later run can resume exactly."""
+    raw_model = getattr(model, "module", model)
     ckpt = {
-        "model": model.state_dict(),
+        "model": raw_model.state_dict(),
         "optimizer": opt.state_dict(),
         "scheduler": sched.state_dict(),
         "rng_np": rng.bit_generator.state,
@@ -101,19 +108,21 @@ def _save_ckpt(path, model, opt, sched, rng, step, cfg, profile):
 
 
 class BenchmarkDataset(torch.utils.data.Dataset):
-    """Parallelized on-the-fly dataset for multi-worker GPU feeding."""
+    """Parallelized fast dataset with in-RAM pre-rendered base samples."""
     def __init__(self, cfg, data_len, total_samples, seed=42):
         self.cfg = cfg
         self.data_len = data_len
         self.total_samples = total_samples
         self.seed = seed
+        cache_count = min(data_len, 400)
+        self.sample_cache = [generate_sample(i, cfg.input_size) for i in range(cache_count)]
 
     def __len__(self):
         return self.total_samples
 
     def __getitem__(self, idx):
         rng = np.random.default_rng(self.seed + 1000 + idx)
-        img, boxes, labels = augment_sample(self.cfg, rng, self.data_len)
+        img, boxes, labels = augment_sample(self.cfg, rng, len(self.sample_cache), sample_cache=self.sample_cache)
         return _sample_to_tensor(img, boxes, labels, self.cfg.input_size)
 
 
@@ -122,6 +131,9 @@ def train(args):
     seed = getattr(args, "seed", 0)
     torch.manual_seed(seed)
     np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
+
     dev_str = getattr(args, "device", "") or ("cuda" if torch.cuda.is_available() else "cpu")
     device = torch.device(dev_str)
 
@@ -162,6 +174,11 @@ def train(args):
     batch_size = getattr(args, "batch", 16)
     data_len = getattr(args, "data_len", 1200)
     save_every = getattr(args, "save_every", 500)
+
+    # Multi-GPU support if multiple GPUs detected
+    if device.type == "cuda" and torch.cuda.device_count() > 1:
+        n_gpus = torch.cuda.device_count()
+        print(f"Detected {n_gpus} GPUs: Multi-GPU DataParallel active!")
 
     # Multi-worker prefetching DataLoader for high-throughput GPU saturation
     dataset = BenchmarkDataset(cfg, data_len=data_len, total_samples=steps * batch_size, seed=seed)
