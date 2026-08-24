@@ -144,6 +144,12 @@ def train(args):
         cfg.input_size = input_size
     model = NanoStreamOD(cfg).to(device)
 
+    # Multi-GPU DataParallel wrapping if multiple GPUs detected
+    if device.type == "cuda" and torch.cuda.device_count() > 1:
+        n_gpus = torch.cuda.device_count()
+        print(f"Detected {n_gpus} GPUs: Enabling Multi-GPU DataParallel!")
+        model = torch.nn.DataParallel(model)
+
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=5e-4)
     warmup = min(50, args.steps // 10)
 
@@ -161,7 +167,8 @@ def train(args):
     resume = getattr(args, "resume", False)
     if resume and ckpt_path.exists():
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-        model.load_state_dict(ckpt["model"])
+        raw_m = getattr(model, "module", model)
+        raw_m.load_state_dict(ckpt["model"])
         opt.load_state_dict(ckpt["optimizer"])
         sched.load_state_dict(ckpt["scheduler"])
         rng.bit_generator.state = ckpt["rng_np"]
@@ -175,19 +182,15 @@ def train(args):
     data_len = getattr(args, "data_len", 1200)
     save_every = getattr(args, "save_every", 500)
 
-    # Multi-GPU support if multiple GPUs detected
-    if device.type == "cuda" and torch.cuda.device_count() > 1:
-        n_gpus = torch.cuda.device_count()
-        print(f"Detected {n_gpus} GPUs: Multi-GPU DataParallel active!")
-
-    # Multi-worker prefetching DataLoader for high-throughput GPU saturation
-    dataset = BenchmarkDataset(cfg, data_len=data_len, total_samples=steps * batch_size, seed=seed)
-    num_workers = min(4, os.cpu_count() or 1) if device.type == "cuda" else 0
-    loader = torch.utils.data.DataLoader(
-        dataset, batch_size=batch_size, shuffle=False,
-        num_workers=num_workers, pin_memory=(device.type == "cuda"),
-        collate_fn=collate, prefetch_factor=2 if num_workers > 0 else None
-    )
+    # Pre-render training pool in memory for instant zero-overhead batching
+    pool_size = min(data_len, 400)
+    pool_imgs = []
+    pool_tgts = []
+    for i in range(pool_size):
+        im, bx, lb = generate_sample(i, cfg.input_size)
+        x, tgt = _sample_to_tensor(im, bx, lb, cfg.input_size)
+        pool_imgs.append(x)
+        pool_tgts.append(tgt)
 
     use_amp = (device.type == "cuda")
     if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
@@ -198,30 +201,28 @@ def train(args):
         autocast_ctx = lambda: torch.cuda.amp.autocast(enabled=use_amp)
 
     model.train()
-    data_iter = iter(loader)
-
-    # Skip already-trained batches if resumed
-    if start_step > 0:
-        for _ in range(start_step):
-            try:
-                next(data_iter)
-            except StopIteration:
-                break
 
     for step in range(start_step, steps):
-        try:
-            xs, ts = next(data_iter)
-        except StopIteration:
-            data_iter = iter(loader)
-            xs, ts = next(data_iter)
+        idxs = rng.integers(0, pool_size, size=batch_size)
+        batch_x = torch.stack([pool_imgs[int(i)] for i in idxs]).to(device, non_blocking=True)
+        batch_t = [{k: v.clone().to(device, non_blocking=True) for k, v in pool_tgts[int(i)].items()} for i in idxs]
 
-        xs = xs.to(device, non_blocking=True)
-        ts = [{k: v.to(device, non_blocking=True) for k, v in t.items()} for t in ts]
+        # Fast tensor augmentation: Random Horizontal Flip on GPU
+        if rng.random() < 0.5:
+            batch_x = torch.flip(batch_x, dims=[-1])
+            for t in batch_t:
+                if len(t["boxes_norm"]) > 0:
+                    t["boxes_norm"][:, 0] = 1.0 - t["boxes_norm"][:, 0]
+
+        # Fast tensor augmentation: Random Brightness
+        if rng.random() < 0.3:
+            scale = float(rng.uniform(0.85, 1.15))
+            batch_x = (batch_x * scale).clamp(-1.0, 1.0)
 
         opt.zero_grad(set_to_none=True)
         with autocast_ctx():
-            preds = model(xs)
-            losses = detection_loss(preds, ts, cfg)
+            preds = model(batch_x)
+            losses = detection_loss(preds, batch_t, cfg)
 
         scaler.scale(losses["total"]).backward()
         scaler.unscale_(opt)
