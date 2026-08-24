@@ -32,4 +32,4 @@ __all__ = [
     "export_to_c",
     "preprocess_image",
 ]
-__version__ = "3.0.0"
+__version__ = "0.1.0"

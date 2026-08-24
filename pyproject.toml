@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nanostream-od"
-version = "3.0.0"
+version = "0.1.0"
 description = "NanoStream-OD: ultra-efficient, NMS-free patch-streaming object detector framework for <256KB RAM edge devices & laptops"
 readme = "README.md"
 requires-python = ">=3.9"
