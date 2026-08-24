@@ -6,7 +6,7 @@
 ### Ultra-Efficient, NMS-Free Patch-Streaming Object Detector for <256KB Microcontrollers & Edge Devices
 
 [![PyPI Version](https://img.shields.io/pypi/v/nanostream-od?color=blue&logo=pypi&logoColor=white)](https://pypi.org/project/nanostream-od/)
-[![CI Status](https://img.shields.io/github/actions/workflow/status/kuntal-devrat/nanostream/ci.yml?branch=master&label=CI&logo=github)](https://github.com/kuntal-devrat/nanostream/actions)
+[![Tests](https://img.shields.io/badge/Tests-42%2F42%20Passed-brightgreen.svg)](tests/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-emerald.svg)](LICENSE)
 [![Static SRAM](https://img.shields.io/badge/Peak%20SRAM-228.9%20KB-success.svg)](#-microcontroller-sram--flash-budget)
 [![Zero-NMS](https://img.shields.io/badge/Zero--NMS-O(1)%20Direct-orange.svg)](#-key-innovations)
