@@ -220,10 +220,10 @@ def cmd_eval(_args):
             val_ds = CombinedDataset(length=VAL_LEN, start_idx=VAL_START, size=size)
             for i, r in enumerate(r_list):
                 if r.boxes is not None and len(r.boxes):
-                    xyxy = r.boxes.xyxy.numpy() / size
+                    xyxy = r.boxes.xyxy.cpu().numpy() / size
                     preds.append({"boxes": xyxy,
-                                  "scores": r.boxes.conf.numpy(),
-                                  "class_ids": r.boxes.cls.numpy().astype(int)})
+                                  "scores": r.boxes.conf.cpu().numpy(),
+                                  "class_ids": r.boxes.cls.cpu().numpy().astype(int)})
                 else:
                     preds.append({"boxes": np.zeros((0, 4)),
                                   "scores": np.zeros(0),
