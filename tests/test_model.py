@@ -23,7 +23,7 @@ def test_model_forward_shapes():
     assert preds["obj"].shape == (2, 1, 10, 10)
     assert preds["box"].shape == (2, 4, 10, 10)
     assert preds["cls"].shape == (2, 3, 10, 10)
-    assert preds["G"] == 10
+    assert preds["obj"].shape[-1] == 10
 
 
 def test_detection_loss_computes():

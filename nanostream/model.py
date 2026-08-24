@@ -42,7 +42,6 @@ class NanoStreamOD(nn.Module):
             p3 = self.neck(p3, p4)
 
         preds = self.head({"p3": p3, "p4": p4}, ctx)
-        preds["G"] = self.cfg.grid_size
         return preds
 
     @torch.no_grad()

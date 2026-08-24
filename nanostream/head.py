@@ -296,7 +296,7 @@ def detection_loss(preds: dict, targets: list, cfg=None, device=None,
     obj_preds = preds["obj"]
     box_preds = preds["box"]
     cls_preds = preds["cls"]
-    G = preds["G"]
+    G = preds["G"] if "G" in preds else obj_preds.shape[-1]
     B = obj_preds.shape[0]
     dev = obj_preds.device
 
